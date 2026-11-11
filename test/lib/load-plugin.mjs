@@ -17,13 +17,15 @@ export class AppPluginStub {
     }
 }
 
-export function loadPlugin() {
+// `globals` are extra free identifiers plugin.js expects from Thymer (e.g. DateTime).
+export function loadPlugin(globals = {}) {
     const src = readFileSync(path.join(root, 'plugin.js'), 'utf8');
-    const factory = new Function('AppPlugin', `${src}\n;return { Plugin, VERSION };`);
-    return factory(AppPluginStub);
+    const names = Object.keys(globals);
+    const factory = new Function('AppPlugin', ...names, `${src}\n;return { Plugin, VERSION, LinkIndex };`);
+    return factory(AppPluginStub, ...names.map(n => globals[n]));
 }
 
-export function newPlugin() {
-    const { Plugin } = loadPlugin();
+export function newPlugin(globals = {}) {
+    const { Plugin } = loadPlugin(globals);
     return new Plugin();
 }

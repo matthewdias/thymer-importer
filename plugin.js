@@ -18,6 +18,208 @@ const VERSION = 'v0.0.12';
  * - Unified import dialog and theme support
  */
 
+// =============================================================================
+// LINK INDEX (shared by the ImportPlan engine; pure, no Thymer APIs)
+// =============================================================================
+
+/**
+ * Maps every alias of an imported record to its stable source key, and (once the
+ * record exists in Thymer) to its record GUID.
+ *
+ * Alias kinds, tried in this order when a link target does not name a kind:
+ *   key        exact source key
+ *   path       source_path, lowercased, without .md; relative links resolve against the linking record's folder
+ *   notion_id  32-hex Notion page id (from the last path segment, or an explicit alias)
+ *   slug       filename without extension, case-folded   ([[home-assistant]] -> home-assistant.md)
+ *   title      case-folded, whitespace-collapsed title
+ *
+ * resolve() never throws. It returns one of
+ *   { status: 'resolved',   ref, key, guid|null, via }   (guid is null until bind() is called)
+ *   { status: 'ambiguous',  ref, via, candidates: [key] }
+ *   { status: 'unresolved', ref, reason: 'not-found' | 'empty' | 'error' }
+ */
+class LinkIndex {
+    static get KINDS() { return ['key', 'path', 'notion_id', 'slug', 'title']; }
+
+    constructor() {
+        this.records = new Map();   // key -> { key, collection, sourcePath, title }
+        this.guids = new Map();     // key -> Thymer record guid
+        this.aliases = new Map();   // kind -> Map(normalized alias -> Set(key))
+        for (const kind of LinkIndex.KINDS) this.aliases.set(kind, new Map());
+    }
+
+    static fromPlan(plan) {
+        const index = new LinkIndex();
+        for (const rec of (plan && plan.records) || []) {
+            index.addRecord({
+                key: rec.key,
+                collection: rec.collection,
+                sourcePath: rec.sourcePath,
+                title: rec.title,
+                aliases: rec.aliases
+            });
+        }
+        return index;
+    }
+
+    // ---- normalisation ------------------------------------------------------
+
+    static normalizePath(value) {
+        const parts = [];
+        for (const seg of String(value == null ? '' : value).replace(/\\/g, '/').normalize('NFC').split('/')) {
+            if (!seg || seg === '.') continue;
+            if (seg === '..') { parts.pop(); continue; }
+            parts.push(seg);
+        }
+        return parts.join('/').toLowerCase().replace(/\.(md|markdown)$/, '');
+    }
+
+    static slugOf(value) {
+        const p = LinkIndex.normalizePath(value);
+        return p.slice(p.lastIndexOf('/') + 1);
+    }
+
+    static normalizeTitle(value) {
+        return String(value == null ? '' : value).normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
+    }
+
+    /** Last 32-hex id (or dashed UUID) found in the string, lowercased and undashed; null if none. */
+    static extractNotionId(value) {
+        const s = String(value == null ? '' : value)
+            .replace(/([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})/gi, '$1$2$3$4$5');
+        const all = s.match(/(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/gi);
+        return all ? all[all.length - 1].toLowerCase() : null;
+    }
+
+    static normalize(kind, value) {
+        if (value == null || String(value).trim() === '') return null;
+        let out;
+        switch (kind) {
+            case 'key': out = String(value).trim(); break;
+            case 'path': out = LinkIndex.normalizePath(value); break;
+            case 'slug': out = LinkIndex.slugOf(value); break;
+            case 'notion_id': out = LinkIndex.extractNotionId(value); break;
+            case 'title': out = LinkIndex.normalizeTitle(value); break;
+            default: return null;
+        }
+        return out ? out : null;
+    }
+
+    // ---- building -----------------------------------------------------------
+
+    addAlias(key, kind, value) {
+        const map = this.aliases.get(kind);
+        const norm = LinkIndex.normalize(kind, value);
+        if (!map || !norm) return false;
+        if (!map.has(norm)) map.set(norm, new Set());
+        map.get(norm).add(key);
+        return true;
+    }
+
+    /** aliases: optional [{ kind, value }] on top of the ones derived from key / sourcePath / title. */
+    addRecord({ key, collection = null, sourcePath = '', title = '', aliases = [] }) {
+        if (key == null || key === '') throw new Error('LinkIndex.addRecord: key is required');
+        this.records.set(key, { key, collection, sourcePath: sourcePath || '', title: title || '' });
+        this.addAlias(key, 'key', key);
+        if (sourcePath) {
+            this.addAlias(key, 'path', sourcePath);
+            this.addAlias(key, 'slug', sourcePath);
+            const base = String(sourcePath).replace(/\\/g, '/').split('/').pop();
+            this.addAlias(key, 'notion_id', base);
+        }
+        if (title) this.addAlias(key, 'title', title);
+        for (const a of aliases || []) {
+            if (a) this.addAlias(key, a.kind, a.value);
+        }
+    }
+
+    bind(key, guid) { this.guids.set(key, guid); }
+    guidOf(key) { return this.guids.has(key) ? this.guids.get(key) : null; }
+    has(key) { return this.records.has(key); }
+    keys() { return Array.from(this.records.keys()); }
+
+    // ---- resolving ----------------------------------------------------------
+
+    /**
+     * target: a string, or { ref, kind? } (kind restricts the lookup to one alias kind).
+     * ctx.fromKey: the linking record (relative paths and same-collection tie-breaks use it).
+     */
+    resolve(target, ctx = {}) {
+        const t = (typeof target === 'string') ? { ref: target } : (target || {});
+        const ref = t.ref == null ? '' : String(t.ref).trim();
+        try {
+            if (!ref) return { status: 'unresolved', ref, reason: 'empty' };
+            const from = ctx.fromKey != null ? (this.records.get(ctx.fromKey) || null) : null;
+            const kinds = t.kind ? [t.kind] : LinkIndex.KINDS;
+            for (const kind of kinds) {
+                let keys = this._lookup(kind, ref, from);
+                if (keys.length === 0) continue;
+                if (keys.length > 1 && from && from.collection != null) {
+                    const same = keys.filter(k => this.records.get(k).collection === from.collection);
+                    if (same.length === 1) keys = same;
+                }
+                if (keys.length > 1) return { status: 'ambiguous', ref, via: kind, candidates: keys };
+                return { status: 'resolved', ref, key: keys[0], guid: this.guidOf(keys[0]), via: kind };
+            }
+            return { status: 'unresolved', ref, reason: 'not-found' };
+        } catch (error) {
+            return { status: 'unresolved', ref, reason: 'error', error: String(error && error.message || error) };
+        }
+    }
+
+    /** links: [{ target, from? }]. Returns { resolved: [{ link, result }], unresolved: [{ link, result }] }. */
+    resolveMany(links) {
+        const out = { resolved: [], unresolved: [] };
+        for (const link of links || []) {
+            const result = this.resolve(link.target, { fromKey: link.from });
+            (result.status === 'resolved' ? out.resolved : out.unresolved).push({ link, result });
+        }
+        return out;
+    }
+
+    _refVariants(ref) {
+        const variants = [ref];
+        try { variants.push(decodeURIComponent(ref)); } catch (e) { /* not URI-encoded */ }
+        for (const v of variants.slice()) variants.push(v.replace(/[#?].*$/s, ''));
+        return Array.from(new Set(variants.filter(v => v !== '')));
+    }
+
+    _lookup(kind, ref, from) {
+        const map = this.aliases.get(kind);
+        if (!map) return [];
+        const hit = (norm) => (norm && map.has(norm)) ? Array.from(map.get(norm)) : [];
+        if (kind === 'key') return hit(LinkIndex.normalize('key', ref));
+        if (kind === 'notion_id') return hit(LinkIndex.normalize('notion_id', ref));
+        for (const v of this._refVariants(ref)) {
+            if (kind === 'path') {
+                if (from && from.sourcePath) {
+                    const dir = String(from.sourcePath).replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+                    const rel = hit(LinkIndex.normalize('path', dir ? `${dir}/${v}` : v));
+                    if (rel.length) return rel;
+                }
+            }
+            const found = hit(LinkIndex.normalize(kind, v));
+            if (found.length) return found;
+        }
+        return [];
+    }
+
+    toJSON() {
+        const aliases = {};
+        for (const [kind, map] of this.aliases) {
+            aliases[kind] = {};
+            for (const [alias, keys] of map) aliases[kind][alias] = Array.from(keys);
+        }
+        return { records: Array.from(this.records.values()), aliases, bound: Object.fromEntries(this.guids) };
+    }
+}
+
+function omitUndefined(obj) {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+    return out;
+}
+
 class Plugin extends AppPlugin {
 
     onLoad() {
@@ -3522,5 +3724,790 @@ class Plugin extends AppPlugin {
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, '_')
             .replace(/^_|_$/g, '');
+    }
+
+    // =========================================================================
+    // IMPORT PLAN ENGINE
+    //
+    // A source parser (pure, testable outside Thymer) produces an ImportPlan;
+    // applyImportPlan() performs every Thymer write. The existing CSV / Obsidian /
+    // Logseq / Joplin / journal flows above do not use this section.
+    //
+    // ImportPlan (plain data; JSON.stringify-able, functions are simply omitted):
+    //   {
+    //     version: 1,
+    //     source: 'tolaria' | 'notion' | ...,
+    //     collections: [{
+    //       key, name, icon: 'ti-*', description, itemName?,
+    //       fields: [{ id, label, type: 'text'|'number'|'choice'|'datetime'|'url'|'record'|...,
+    //                  many?, icon?, choices?: [label | { id?, label, color? }],
+    //                  target?: <collection key>   // type 'record': becomes filter_colguid
+    //                  numberFormat? }]
+    //     }],
+    //     records: [{
+    //       key,                 // stable source key (unique in the plan)
+    //       collection,          // collection key
+    //       title, sourcePath,   // sourcePath is stored in the source_path field and drives dedupe
+    //       aliases?: [{ kind, value }],   // extra LinkIndex aliases (kind: key|path|notion_id|slug|title)
+    //       values: { <fieldId>: scalar | scalar[] },   // NOT record-type fields (use links)
+    //       body: markdown       // may contain ⟦link:Lx⟧ / ⟦asset:Ax⟧ placeholders
+    //     }],
+    //     links: [{
+    //       id: 'L1', from: <record key>,
+    //       where: 'body' | 'property', field?: <fieldId, when where==='property'>,
+    //       target: { ref, kind? },   // ref: path / slug / notion id / title, see LinkIndex
+    //       label?,                   // display text for a body ref
+    //       raw?                      // text to leave behind if unresolved (e.g. '[[x|y]]')
+    //     }],
+    //     assets: [{ id: 'A1', record: <record key>, sourcePath, name?, contentType?, raw?,
+    //                readBytes?: async () => ArrayBuffer | Uint8Array }],   // body holds ⟦asset:A1⟧
+    //     journal: [{ date: 'YYYY-MM-DD', markdown, sourcePath? }]
+    //   }
+    //
+    // Build one with createImportPlan() + planBodyLink() / planPropertyLink() / planAsset(),
+    // which return the placeholder to splice into the record body.
+    // =========================================================================
+
+    createImportPlan(source = '') {
+        return { version: 1, source, collections: [], records: [], links: [], assets: [], journal: [] };
+    }
+
+    _planTarget(target) {
+        return typeof target === 'string' ? { ref: target } : omitUndefined({ ref: target.ref, kind: target.kind });
+    }
+
+    /** Registers a link found in a record body; returns the placeholder to put in the markdown. */
+    planBodyLink(plan, recordKey, target, { label, raw } = {}) {
+        const id = `L${plan.links.length + 1}`;
+        plan.links.push(omitUndefined({ id, from: recordKey, where: 'body', target: this._planTarget(target), label, raw }));
+        return `⟦link:${id}⟧`;
+    }
+
+    /** Registers a record-reference property value (call once per value, in order, for many-fields). */
+    planPropertyLink(plan, recordKey, fieldId, target, { label, raw } = {}) {
+        const id = `L${plan.links.length + 1}`;
+        plan.links.push(omitUndefined({ id, from: recordKey, where: 'property', field: fieldId, target: this._planTarget(target), label, raw }));
+        return id;
+    }
+
+    /** Registers an asset referenced from a record body; returns the placeholder to put in the markdown. */
+    planAsset(plan, recordKey, { sourcePath, name, contentType, raw, readBytes }) {
+        const id = `A${plan.assets.length + 1}`;
+        plan.assets.push(omitUndefined({ id, record: recordKey, sourcePath, name, contentType, raw, readBytes }));
+        return `⟦asset:${id}⟧`;
+    }
+
+    /** Structural problems in a plan, as [{ code, message, ... }]. Never throws. */
+    validateImportPlan(plan) {
+        const problems = [];
+        const add = (code, message, extra = {}) => problems.push({ code, message, ...extra });
+        if (!plan || typeof plan !== 'object') return [{ code: 'bad-plan', message: 'plan is not an object' }];
+        if (plan.version !== 1) add('bad-version', `unsupported plan version ${plan.version}`);
+
+        const collections = new Map();
+        const names = new Set();
+        for (const c of plan.collections || []) {
+            if (collections.has(c.key)) add('duplicate-collection', `duplicate collection key ${c.key}`, { collection: c.key });
+            collections.set(c.key, c);
+            const n = String(c.name || '').trim().toLowerCase();
+            if (names.has(n)) add('duplicate-collection-name', `two collections are named "${c.name}"`, { collection: c.key });
+            names.add(n);
+            for (const f of c.fields || []) {
+                if (f.type === 'record' && f.target && !(plan.collections || []).some(x => x.key === f.target)) {
+                    add('unknown-target-collection', `field ${f.id} targets unknown collection ${f.target}`, { collection: c.key, field: f.id });
+                }
+            }
+        }
+
+        const records = new Map();
+        for (const r of plan.records || []) {
+            if (records.has(r.key)) add('duplicate-record', `duplicate record key ${r.key}`, { record: r.key });
+            records.set(r.key, r);
+            const col = collections.get(r.collection);
+            if (!col) { add('unknown-collection', `record ${r.key} has unknown collection ${r.collection}`, { record: r.key }); continue; }
+            const fieldIds = new Set((col.fields || []).map(f => f.id || this.slugify(f.label)));
+            for (const fieldId of Object.keys(r.values || {})) {
+                if (!fieldIds.has(fieldId)) add('unknown-field', `record ${r.key} sets undeclared field ${fieldId}`, { record: r.key, field: fieldId });
+            }
+        }
+
+        const linkIds = new Set();
+        for (const l of plan.links || []) {
+            if (linkIds.has(l.id)) add('duplicate-link', `duplicate link id ${l.id}`, { link: l.id });
+            linkIds.add(l.id);
+            const rec = records.get(l.from);
+            if (!rec) { add('link-from-unknown-record', `link ${l.id} is from unknown record ${l.from}`, { link: l.id }); continue; }
+            if (l.where === 'property') {
+                const col = collections.get(rec.collection);
+                const field = col && (col.fields || []).find(f => (f.id || this.slugify(f.label)) === l.field);
+                if (!field || field.type !== 'record') add('link-field-not-record', `link ${l.id} targets field ${l.field}, which is not a declared record field`, { link: l.id, field: l.field });
+            } else if (l.where !== 'body') {
+                add('bad-link-where', `link ${l.id} has where=${l.where}`, { link: l.id });
+            }
+        }
+        for (const a of plan.assets || []) {
+            if (!records.has(a.record)) add('asset-for-unknown-record', `asset ${a.id} belongs to unknown record ${a.record}`, { asset: a.id });
+        }
+        return problems;
+    }
+
+    /**
+     * Performs every Thymer write for a plan, in passes:
+     *   1 collections  2 records (scalar props + body with placeholders)
+     *   3 links (body refs + record-reference properties)  4 assets  5 journal
+     * Data problems never abort the run; they land in the returned report.
+     *
+     * opts: { onProgress({ pass, message, done, total }),
+     *         existing: 'update' (default) | 'skip'   what to do with records already in Thymer,
+     *         readAsset(asset) -> bytes               fallback when asset.readBytes is absent,
+     *         journalCollection,                       defaults to the workspace's journal,
+     *         sleep(ms), settleMs, collectionSettleMs  timing hooks (tests pass instant sleeps) }
+     */
+    async applyImportPlan(plan, opts = {}) {
+        if (!plan || typeof plan !== 'object' || !Array.isArray(plan.records)) {
+            throw new TypeError('applyImportPlan: not an ImportPlan');
+        }
+        const report = {
+            source: plan.source || '',
+            counts: {
+                collectionsCreated: 0, collectionsUpdated: 0,
+                recordsCreated: 0, recordsUpdated: 0, recordsSkipped: 0, recordsFailed: 0,
+                linksResolved: 0, linksUnresolved: 0,
+                assetsUploaded: 0, assetsFailed: 0,
+                journalCreated: 0, journalSkipped: 0
+            },
+            unresolvedLinks: [],
+            errors: [],
+            warnings: this.validateImportPlan(plan)
+        };
+        const ctx = {
+            plan, opts, report,
+            index: LinkIndex.fromPlan(plan),
+            collections: new Map(),   // collection key -> { def, api, guid, created, failed }
+            records: new Map(),       // record key -> { def, record }
+            linkResults: new Map()    // link id -> LinkIndex result
+        };
+        ctx.progress = (pass, message, done = 0, total = 0) => {
+            try { if (typeof opts.onProgress === 'function') opts.onProgress({ pass, message, done, total }); } catch (e) { /* UI errors must not stop the import */ }
+        };
+
+        const passes = [
+            [1, 'collections', () => this._planPassCollections(ctx)],
+            [2, 'records', () => this._planPassRecords(ctx)],
+            [3, 'links', () => this._planPassLinks(ctx)],
+            [4, 'assets', () => this._planPassAssets(ctx)],
+            [5, 'journal', () => this._planPassJournal(ctx)]
+        ];
+        for (const [pass, name, run] of passes) {
+            try {
+                await run();
+            } catch (error) {
+                console.error(`[ImportPlan] pass ${pass} (${name}) crashed:`, error);
+                report.errors.push({ pass, message: `pass ${name} crashed: ${error && error.message || error}` });
+            }
+        }
+        return report;
+    }
+
+    _planSleep(ctx, ms) {
+        return typeof ctx.opts.sleep === 'function' ? ctx.opts.sleep(ms) : new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    _planError(ctx, pass, error, extra = {}) {
+        console.error(`[ImportPlan] pass ${pass}:`, error);
+        ctx.report.errors.push({ pass, ...extra, message: String(error && error.message || error) });
+    }
+
+    // ---- pass 1: collections ------------------------------------------------
+
+    async _planPassCollections(ctx) {
+        const defs = ctx.plan.collections || [];
+        ctx.progress(1, 'Creating collections', 0, defs.length);
+        const byName = new Map();
+        for (const c of await this.data.getAllCollections()) {
+            if (typeof c.isJournalPlugin === 'function' && c.isJournalPlugin()) continue;
+            const n = String(c.getName() || '').trim().toLowerCase();
+            if (n && !byName.has(n)) byName.set(n, c);
+        }
+
+        // 1a: find or create a shell for every collection, so GUIDs exist before record fields reference them
+        for (const def of defs) {
+            try {
+                const name = String(def.name || '').trim().toLowerCase();
+                let api = byName.get(name);
+                let created = false;
+                if (!api) {
+                    api = await this.data.createCollection();
+                    if (!api) throw new Error('createCollection returned null');
+                    created = true;
+                    byName.set(name, api);
+                }
+                ctx.collections.set(def.key, { def, api, guid: api.getGuid(), created, failed: false });
+            } catch (error) {
+                this._planError(ctx, 1, error, { collection: def.key });
+                ctx.collections.set(def.key, { def, failed: true });
+            }
+        }
+
+        // 1b: write names / icons / descriptions / fields
+        let done = 0;
+        for (const entry of ctx.collections.values()) {
+            if (entry.failed) continue;
+            try {
+                const config = entry.api.getConfiguration();
+                this._planApplyCollectionConfig(ctx, entry, config);
+                if (await entry.api.saveConfiguration(config) === false) {
+                    throw new Error('saveConfiguration returned false');
+                }
+            } catch (error) {
+                entry.failed = true;
+                this._planError(ctx, 1, error, { collection: entry.def.key });
+            }
+            ctx.progress(1, `Configured ${entry.def.name}`, ++done, defs.length);
+        }
+
+        // 1c: re-read, as the existing collection flow does, and make sure the fields persisted
+        await this._planSleep(ctx, ctx.opts.collectionSettleMs ?? 500);
+        const fresh = await this.data.getAllCollections();
+        for (const entry of ctx.collections.values()) {
+            if (entry.failed) continue;
+            const api = fresh.find(c => c.getGuid() === entry.guid);
+            if (!api) {
+                entry.failed = true;
+                this._planError(ctx, 1, new Error('collection disappeared after configuration'), { collection: entry.def.key });
+                continue;
+            }
+            const saved = new Set((api.getConfiguration().fields || []).map(f => f.id));
+            const missing = this._planFieldConfigs(ctx, entry.def).filter(f => !saved.has(f.id)).map(f => f.id);
+            if (missing.length) {
+                ctx.report.warnings.push({ code: 'fields-not-persisted', message: `fields missing after save: ${missing.join(', ')}`, collection: entry.def.key });
+            }
+            entry.api = api;
+            ctx.report.counts[entry.created ? 'collectionsCreated' : 'collectionsUpdated']++;
+        }
+    }
+
+    _planFieldType(fd) { return fd.type || 'text'; }
+
+    _planFieldIcon(fd) {
+        if (fd.icon) return fd.icon;
+        return this._planFieldType(fd) === 'record' ? 'ti-arrow-right' : this.getFieldIcon(this._planFieldType(fd));
+    }
+
+    /** Distinct string values a plan stores in a choice field, in first-seen order. */
+    _planChoiceLabels(ctx, def, fieldId, declared) {
+        const labels = [];
+        const seen = new Set();
+        const add = (v) => {
+            if (v === null || v === undefined || v === '') return;
+            const label = String(v);
+            if (!seen.has(label.toLowerCase())) { seen.add(label.toLowerCase()); labels.push(label); }
+        };
+        for (const c of declared || []) add(typeof c === 'string' ? c : c.label);
+        for (const rec of ctx.plan.records) {
+            if (rec.collection !== def.key || !rec.values || rec.values[fieldId] === undefined) continue;
+            const t = this.transformValue(rec.values[fieldId]);
+            for (const v of (Array.isArray(t) ? t : [t])) add(v);
+        }
+        return labels;
+    }
+
+    _planChoiceOptions(labels, declared, startIndex = 0, usedIds = new Set()) {
+        const byLabel = new Map((declared || []).filter(c => typeof c === 'object').map(c => [c.label, c]));
+        return labels.map((label, i) => {
+            const d = byLabel.get(label) || {};
+            let id = d.id || this.slugify(label) || `choice_${startIndex + i}`;
+            while (usedIds.has(id)) id = `${id}_${startIndex + i}`;
+            usedIds.add(id);
+            return { id, label, icon: d.icon || '', color: d.color !== undefined ? String(d.color) : String((startIndex + i) % 10), active: true };
+        });
+    }
+
+    /** Thymer field configs (incl. the built-in source_path) for a plan collection. */
+    _planFieldConfigs(ctx, def) {
+        const out = [];
+        const seen = new Set();
+        const push = (f) => { if (f.id && !seen.has(f.id)) { seen.add(f.id); out.push(f); } };
+        push({ id: 'source_path', label: 'Source Path', type: 'text', icon: 'ti-link', many: false, read_only: true, active: true });
+        for (const fd of def.fields || []) {
+            const type = this._planFieldType(fd);
+            const id = fd.id || this.slugify(fd.label);
+            const field = { id, label: fd.label || id, type, icon: this._planFieldIcon(fd), many: fd.many === true, read_only: false, active: true };
+            if (type === 'choice') {
+                const labels = this._planChoiceLabels(ctx, def, id, fd.choices);
+                field.choices = this._planChoiceOptions(labels, fd.choices);
+            }
+            if (type === 'record' && fd.target) {
+                const target = ctx.collections.get(fd.target);
+                if (target && target.guid) field.filter_colguid = target.guid;
+            }
+            if (type === 'number' && fd.numberFormat) field.number_format = fd.numberFormat;
+            push(field);
+        }
+        return out;
+    }
+
+    _planApplyCollectionConfig(ctx, entry, config) {
+        const def = entry.def;
+        const wanted = this._planFieldConfigs(ctx, def);
+        if (entry.created) {
+            config.name = def.name;
+            config.icon = def.icon || 'ti-notebook';
+            config.item_name = def.itemName || 'Note';
+            config.description = def.description !== undefined ? def.description : `Imported from ${ctx.plan.source || 'Markdown'}`;
+            config.fields = wanted;
+            config.page_field_ids = wanted.map(f => f.id);
+            config.sidebar_record_sort_field_id = wanted[0].id;
+            config.sidebar_record_sort_dir = 'desc';
+            config.show_sidebar_items = true;
+            config.show_cmdpal_items = true;
+            config.views = [{
+                id: 'table', label: `All ${def.name}`, description: 'Table view', type: 'table', icon: '',
+                shown: true, read_only: false, sort_field_id: wanted[0].id, sort_dir: 'asc',
+                group_by_field_id: null, field_ids: wanted.map(f => f.id).slice(0, 8), opts: {}
+            }];
+            return;
+        }
+
+        // Existing collection: add what is missing, never remove or retype anything.
+        const fields = Array.isArray(config.fields) ? config.fields : [];
+        const byId = new Map(fields.map(f => [f.id, f]));
+        for (const w of wanted) {
+            const have = byId.get(w.id);
+            if (!have) {
+                fields.push(w);
+                if (Array.isArray(config.page_field_ids)) config.page_field_ids.push(w.id);
+                continue;
+            }
+            if (have.type === 'choice' && w.type === 'choice') {
+                have.choices = have.choices || [];
+                const known = new Set(have.choices.map(c => String(c.label).toLowerCase()));
+                const used = new Set(have.choices.map(c => c.id));
+                const fresh = w.choices.filter(c => !known.has(c.label.toLowerCase())).map(c => c.label);
+                have.choices.push(...this._planChoiceOptions(fresh, [], have.choices.length, used));
+            }
+            if (have.type === 'record' && !have.filter_colguid && w.filter_colguid) {
+                have.filter_colguid = w.filter_colguid;
+            }
+        }
+        config.fields = fields;
+        if (!config.icon && def.icon) config.icon = def.icon;
+        if (!config.description && def.description) config.description = def.description;
+    }
+
+    // ---- pass 2: records ----------------------------------------------------
+
+    async _planWaitForRecord(ctx, collection, guid) {
+        const direct = typeof this.data.getRecord === 'function' ? this.data.getRecord(guid) : null;
+        if (direct) return direct;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            await this._planSleep(ctx, 100 + attempt * 50);
+            const found = (await collection.getAllRecords()).find(r => r.guid === guid);
+            if (found) return found;
+        }
+        throw new Error(`record ${guid} not found after creation`);
+    }
+
+    /** Same dedupe keys as executeImport(): source_path||title, plus title-only for records that have no path. */
+    async _planExistingRecords(collection) {
+        const byKey = new Map();
+        for (const record of await collection.getAllRecords()) {
+            const pathValue = typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '';
+            const key = this.makeDedupKey(pathValue, record.getName());
+            if (key.trim() !== '||') byKey.set(key, record);
+        }
+        return byKey;
+    }
+
+    /** Deletes a record's body (children first). Never follows references into other records. */
+    async _planClearBody(record) {
+        let items = (await record.getLineItems(false)).filter(i => i.type !== 'document');
+        for (let round = 0; round < 3 && items.length; round++) {
+            const failed = [];
+            for (const item of items.slice().reverse()) {
+                if (!(await item.delete())) failed.push(item);
+            }
+            items = failed.reverse();
+        }
+        if (items.length) throw new Error(`could not delete ${items.length} old line items`);
+    }
+
+    async _planPassRecords(ctx) {
+        const records = ctx.plan.records;
+        const existingByCollection = new Map();
+        let done = 0;
+        ctx.progress(2, 'Creating records', 0, records.length);
+
+        for (const def of records) {
+            ctx.progress(2, `Record ${def.title}`, done++, records.length);
+            const col = ctx.collections.get(def.collection);
+            if (!col || col.failed) {
+                ctx.report.counts.recordsFailed++;
+                ctx.report.errors.push({ pass: 2, record: def.key, message: `collection ${def.collection} is unavailable` });
+                continue;
+            }
+            try {
+                if (!existingByCollection.has(def.collection)) {
+                    existingByCollection.set(def.collection, await this._planExistingRecords(col.api));
+                }
+                const existingByKey = existingByCollection.get(def.collection);
+                const pathKey = this.makeDedupKey(def.sourcePath, def.title);
+                let found = existingByKey.get(pathKey);
+                if (!found) {
+                    // Adopt a record that has the same title but no source_path yet, once only
+                    // (executeImport() keeps the fallback key, so same-titled files overwrite each other).
+                    const fallbackKey = this.makeDedupKey('', def.title);
+                    found = existingByKey.get(fallbackKey);
+                    if (found) existingByKey.delete(fallbackKey);
+                }
+                let record = found;
+                const isUpdate = !!found;
+
+                if (isUpdate && ctx.opts.existing === 'skip') {
+                    ctx.index.bind(def.key, found.guid);
+                    ctx.records.set(def.key, { def, record: found, skipped: true });
+                    ctx.report.counts.recordsSkipped++;
+                    continue;
+                }
+
+                if (!isUpdate) {
+                    const guid = col.api.createRecord(def.title);
+                    if (!guid) throw new Error('createRecord returned null');
+                    record = await this._planWaitForRecord(ctx, col.api, guid);
+                    await this._planSleep(ctx, ctx.opts.settleMs ?? 300);
+                }
+                ctx.index.bind(def.key, record.guid);
+                existingByKey.set(pathKey, record);
+                ctx.records.set(def.key, { def, record });
+
+                if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
+                    ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
+                }
+                for (const [fieldId, value] of Object.entries(def.values || {})) {
+                    if (value === null || value === undefined || value === '') continue;
+                    if (Array.isArray(value) && value.length === 0) continue;
+                    if (!this.setFieldValue(record, fieldId, this.transformValue(value))) {
+                        ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId} not set`, record: def.key, field: fieldId });
+                    }
+                }
+
+                if (isUpdate) await this._planClearBody(record);
+                if (def.body) {
+                    const ok = await record.insertFromMarkdown(this.prepareMarkdownForThymerImport(def.body), null, null);
+                    if (!ok) throw new Error('insertFromMarkdown returned false');
+                }
+                ctx.report.counts[isUpdate ? 'recordsUpdated' : 'recordsCreated']++;
+            } catch (error) {
+                ctx.report.counts.recordsFailed++;
+                this._planError(ctx, 2, error, { record: def.key });
+            }
+        }
+    }
+
+    // ---- placeholders -------------------------------------------------------
+
+    _planHasPlaceholder(segments, kinds) {
+        const re = new RegExp(`⟦(${kinds.join('|')}):[A-Za-z0-9_-]+⟧`);
+        return Array.isArray(segments) && segments.some(s => typeof s.text === 'string' && re.test(s.text));
+    }
+
+    /**
+     * Replaces ⟦kind:id⟧ placeholders inside text/bold/italic/code segments.
+     * replacer(kind, id) -> { segment } | { text } (| null to leave the placeholder alone).
+     */
+    _planRewriteSegments(segments, kinds, replacer) {
+        const re = new RegExp(`⟦(${kinds.join('|')}):([A-Za-z0-9_-]+)⟧`, 'g');
+        const styled = new Set(['text', 'bold', 'italic', 'code']);
+        const out = [];
+        let changed = false;
+        for (const seg of segments) {
+            if (!styled.has(seg.type) || typeof seg.text !== 'string' || !seg.text.includes('⟦')) { out.push(seg); continue; }
+            let last = 0;
+            let m;
+            re.lastIndex = 0;
+            const pieces = [];
+            while ((m = re.exec(seg.text)) !== null) {
+                const rep = replacer(m[1], m[2]);
+                if (!rep) continue;
+                if (m.index > last) pieces.push({ type: seg.type, text: seg.text.slice(last, m.index) });
+                if (rep.segment && seg.type !== 'code') pieces.push(rep.segment);
+                else if (rep.text) pieces.push({ type: seg.type, text: rep.text });
+                else if (rep.segment) pieces.push({ type: 'code', text: rep.fallback || '' });
+                last = m.index + m[0].length;
+                changed = true;
+            }
+            if (last === 0 && pieces.length === 0) { out.push(seg); continue; }
+            if (last < seg.text.length) pieces.push({ type: seg.type, text: seg.text.slice(last) });
+            out.push(...pieces);
+        }
+        return { segments: out, changed };
+    }
+
+    // ---- pass 3: links ------------------------------------------------------
+
+    _planResolveLink(ctx, link) {
+        if (ctx.linkResults.has(link.id)) return ctx.linkResults.get(link.id);
+        const result = ctx.index.resolve(link.target, { fromKey: link.from });
+        const ok = result.status === 'resolved' && !!result.guid && ctx.records.has(result.key);
+        if (ok) {
+            ctx.report.counts.linksResolved++;
+        } else {
+            ctx.report.counts.linksUnresolved++;
+            const from = ctx.records.get(link.from);
+            ctx.report.unresolvedLinks.push(omitUndefined({
+                linkId: link.id, from: link.from, fromTitle: from ? from.def.title : undefined,
+                where: link.where, field: link.field, ref: link.target.ref,
+                reason: result.status === 'resolved' ? 'target-not-imported' : (result.status === 'ambiguous' ? 'ambiguous' : result.reason),
+                candidates: result.candidates
+            }));
+        }
+        ctx.linkResults.set(link.id, ok ? result : null);
+        return ctx.linkResults.get(link.id);
+    }
+
+    async _planPassLinks(ctx) {
+        const links = ctx.plan.links || [];
+        ctx.progress(3, 'Resolving links', 0, links.length);
+        const byRecord = new Map();
+        for (const link of links) {
+            if (!byRecord.has(link.from)) byRecord.set(link.from, []);
+            byRecord.get(link.from).push(link);
+        }
+        const linksById = new Map(links.map(l => [l.id, l]));
+        let done = 0;
+        for (const [key, own] of byRecord) {
+            const entry = ctx.records.get(key);
+            ctx.progress(3, `Links in ${entry ? entry.def.title : key}`, done += own.length, links.length);
+            if (!entry) continue; // the record itself failed in pass 2 and is already in report.errors
+
+            try {
+                await this._planApplyPropertyLinks(ctx, entry, own.filter(l => l.where === 'property'));
+            } catch (error) {
+                this._planError(ctx, 3, error, { record: key });
+            }
+            const bodyLinks = own.filter(l => l.where === 'body');
+            if (bodyLinks.length === 0) continue;
+            try {
+                await this._planApplyBodyLinks(ctx, entry, bodyLinks, linksById);
+            } catch (error) {
+                this._planError(ctx, 3, error, { record: key });
+            }
+        }
+    }
+
+    async _planApplyPropertyLinks(ctx, entry, links) {
+        const byField = new Map();
+        for (const link of links) {
+            if (!byField.has(link.field)) byField.set(link.field, []);
+            byField.get(link.field).push(link);
+        }
+        for (const [fieldId, fieldLinks] of byField) {
+            const guids = [];
+            for (const link of fieldLinks) {
+                const result = this._planResolveLink(ctx, link);
+                if (result && !guids.includes(result.guid)) guids.push(result.guid);
+            }
+            if (guids.length === 0) continue;
+            const prop = entry.record.prop(fieldId);
+            if (!prop) {
+                ctx.report.errors.push({ pass: 3, record: entry.def.key, message: `record has no property ${fieldId}` });
+                continue;
+            }
+            const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
+            if (!multi && guids.length > 1) {
+                ctx.report.warnings.push({ code: 'extra-values-dropped', message: `${fieldId} is single-value; kept the first of ${guids.length}`, record: entry.def.key, field: fieldId });
+            }
+            prop.set(multi ? guids : guids[0]);
+        }
+    }
+
+    async _planApplyBodyLinks(ctx, entry, bodyLinks, linksById) {
+        const own = new Set(bodyLinks.map(l => l.id));
+        const seen = new Set();
+        for (const item of await entry.record.getLineItems(false)) {
+            if (!this._planHasPlaceholder(item.segments, ['link'])) continue;
+            const { segments, changed } = this._planRewriteSegments(item.segments, ['link'], (kind, id) => {
+                const link = linksById.get(id);
+                if (!link || !own.has(id)) return { text: '' };
+                seen.add(id);
+                const result = this._planResolveLink(ctx, link);
+                const fallback = link.raw !== undefined ? link.raw : (link.label !== undefined ? link.label : link.target.ref);
+                if (!result) return { text: fallback };
+                return { segment: { type: 'ref', text: omitUndefined({ guid: result.guid, title: link.label }) }, fallback };
+            });
+            if (changed && (await item.setSegments(segments)) === false) {
+                ctx.report.errors.push({ pass: 3, record: entry.def.key, message: 'setSegments returned false while linking' });
+            }
+        }
+        for (const link of bodyLinks) {
+            if (!seen.has(link.id)) {
+                this._planResolveLink(ctx, link);
+                ctx.report.warnings.push({ code: 'placeholder-not-found', message: `body link ${link.id} was not found in the inserted body`, record: entry.def.key, link: link.id });
+            }
+        }
+    }
+
+    // ---- pass 4: assets -----------------------------------------------------
+
+    _planContentType(asset) {
+        if (asset.contentType) return asset.contentType;
+        const ext = String(asset.name || asset.sourcePath || '').split('.').pop().toLowerCase();
+        const map = {
+            png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+            svg: 'image/svg+xml', bmp: 'image/bmp', heic: 'image/heic', avif: 'image/avif', pdf: 'application/pdf'
+        };
+        return map[ext] || 'application/octet-stream';
+    }
+
+    async _planUploadAsset(ctx, asset) {
+        const cacheKey = asset.sourcePath || asset.id;
+        if (!ctx.blobs) ctx.blobs = new Map();
+        if (ctx.blobs.has(cacheKey)) return ctx.blobs.get(cacheKey);
+        const read = typeof asset.readBytes === 'function' ? asset.readBytes : (typeof ctx.opts.readAsset === 'function' ? () => ctx.opts.readAsset(asset) : null);
+        if (!read) throw new Error('asset has no readBytes and no readAsset option was given');
+        const bytes = await read();
+        const name = asset.name || String(asset.sourcePath || asset.id).split('/').pop();
+        const blob = await this.data.uploadBlob(new File([bytes], name, { type: this._planContentType(asset) }));
+        if (!blob) throw new Error('uploadBlob returned null');
+        ctx.blobs.set(cacheKey, blob);
+        return blob;
+    }
+
+    async _planPassAssets(ctx) {
+        const assets = ctx.plan.assets || [];
+        ctx.progress(4, 'Uploading assets', 0, assets.length);
+        const byRecord = new Map();
+        for (const a of assets) {
+            if (!byRecord.has(a.record)) byRecord.set(a.record, []);
+            byRecord.get(a.record).push(a);
+        }
+        let done = 0;
+        for (const [key, own] of byRecord) {
+            const entry = ctx.records.get(key);
+            if (!entry) continue;
+            try {
+                await this._planInsertAssets(ctx, entry, own);
+            } catch (error) {
+                ctx.report.counts.assetsFailed += own.length;
+                this._planError(ctx, 4, error, { record: key });
+            }
+            ctx.progress(4, `Assets in ${entry.def.title}`, done += own.length, assets.length);
+        }
+    }
+
+    async _planInsertAssets(ctx, entry, assets) {
+        const byId = new Map(assets.map(a => [a.id, a]));
+        const blobs = new Map();       // asset id -> PluginBlob | null (failed)
+        const placed = new Set();
+        const items = await entry.record.getLineItems(false);
+
+        const upload = async (asset) => {
+            if (blobs.has(asset.id)) return blobs.get(asset.id);
+            try {
+                const blob = await this._planUploadAsset(ctx, asset);
+                blobs.set(asset.id, blob);
+                return blob;
+            } catch (error) {
+                this._planError(ctx, 4, error, { record: entry.def.key, asset: asset.id });
+                blobs.set(asset.id, null);
+                ctx.report.counts.assetsFailed++;
+                return null;
+            }
+        };
+        const insertAfter = async (parent, after, asset, blob) => {
+            const type = this._planContentType(asset).startsWith('image/') ? 'image' : 'file';
+            const line = await entry.record.createLineItem(parent, after, type, null, null);
+            if (!line || (await line.setBlob(blob)) === false) {
+                if (line) await line.delete();
+                throw new Error(`could not create ${type} line item`);
+            }
+            return line;
+        };
+
+        for (const item of items) {
+            if (!this._planHasPlaceholder(item.segments, ['asset'])) continue;
+            const ids = [];
+            this._planRewriteSegments(item.segments, ['asset'], (kind, id) => { ids.push(id); return null; });
+            const parent = item.parent_guid ? (items.find(i => i.guid === item.parent_guid) || null) : null;
+            let after = item;
+            for (const id of ids) {
+                const asset = byId.get(id);
+                if (!asset || placed.has(id)) continue;
+                placed.add(id);
+                const blob = await upload(asset);
+                if (!blob) continue;
+                try {
+                    after = await insertAfter(parent, after, asset, blob);
+                    ctx.report.counts.assetsUploaded++;
+                } catch (error) {
+                    blobs.set(id, null);
+                    ctx.report.counts.assetsFailed++;
+                    this._planError(ctx, 4, error, { record: entry.def.key, asset: id });
+                }
+            }
+            const fallbackText = (id) => {
+                const a = byId.get(id);
+                return a ? (a.raw !== undefined ? a.raw : `[${a.name || String(a.sourcePath || id).split('/').pop()}]`) : '';
+            };
+            const { segments } = this._planRewriteSegments(item.segments, ['asset'], (kind, id) => ({ text: blobs.get(id) ? '' : fallbackText(id) }));
+            const empty = segments.every(s => typeof s.text === 'string' && s.text.trim() === '');
+            if (!(empty && (await item.delete()))) await item.setSegments(segments.length ? segments : [{ type: 'text', text: '' }]);
+        }
+
+        // Assets whose placeholder never made it into the body go at the end of the record.
+        const stray = assets.filter(a => !placed.has(a.id));
+        if (stray.length) {
+            let after = items.filter(i => !i.parent_guid).pop() || null;
+            for (const asset of stray) {
+                ctx.report.warnings.push({ code: 'asset-placeholder-not-found', message: `asset ${asset.id} was not referenced in the body; appended`, record: entry.def.key, asset: asset.id });
+                const blob = await upload(asset);
+                if (!blob) continue;
+                try {
+                    after = await insertAfter(null, after, asset, blob);
+                    ctx.report.counts.assetsUploaded++;
+                } catch (error) {
+                    ctx.report.counts.assetsFailed++;
+                    this._planError(ctx, 4, error, { record: entry.def.key, asset: asset.id });
+                }
+            }
+        }
+    }
+
+    // ---- pass 5: journal ----------------------------------------------------
+
+    async _planPassJournal(ctx) {
+        const entries = ctx.plan.journal || [];
+        if (entries.length === 0) return;
+        ctx.progress(5, 'Importing journal entries', 0, entries.length);
+        let journal = ctx.opts.journalCollection;
+        if (!journal) journal = (await this.data.getAllCollections()).find(c => typeof c.isJournalPlugin === 'function' && c.isJournalPlugin());
+        const user = this.data.getActiveUsers()[0];
+        if (!journal || !user) {
+            ctx.report.warnings.push({ code: 'no-journal', message: 'no journal collection or active user; journal entries skipped' });
+            ctx.report.counts.journalSkipped += entries.length;
+            return;
+        }
+        let done = 0;
+        for (const entry of entries) {
+            try {
+                const [year, month, day] = String(entry.date).split('-').map(n => parseInt(n, 10));
+                const page = await journal.getJournalRecord(user, DateTime.dateOnly(year, month - 1, day));
+                if (!page) throw new Error(`no journal page for ${entry.date}`);
+                const existing = await page.getLineItems(false);
+                if (existing && existing.length) {
+                    // Journal pages hold the user's own writing; never replace them on re-import.
+                    ctx.report.counts.journalSkipped++;
+                    ctx.report.warnings.push({ code: 'journal-page-not-empty', message: `journal page ${entry.date} already has content; skipped` });
+                } else if (entry.markdown) {
+                    if (!(await page.insertFromMarkdown(this.prepareMarkdownForThymerImport(entry.markdown), null, null))) {
+                        throw new Error('insertFromMarkdown returned false');
+                    }
+                    ctx.report.counts.journalCreated++;
+                }
+            } catch (error) {
+                this._planError(ctx, 5, error, { journal: entry.date });
+            }
+            ctx.progress(5, `Journal ${entry.date}`, ++done, entries.length);
+        }
     }
 }
