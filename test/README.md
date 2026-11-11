@@ -11,10 +11,12 @@ Run with `npm test` (Node 20+, no dependencies).
 - `smoke.test.mjs`: plugin loads, CSV parsing.
 - `link-index.test.mjs`: `LinkIndex` alias resolution (path, slug, Notion id, title, ambiguity).
 - `engine.test.mjs`: `applyImportPlan()` against the fake (collections, dedupe, links, unresolved links, multi-value references, assets, journal, failure isolation).
+- `notion.test.mjs`: `parseNotionExport()` on `fixtures/notion` (plan snapshot, relations, link-by-title candidates, bodies/links/assets/callouts, directory handle vs file list), `applyImportPlan()` on the fake, the dialog's Notion branch with a stub DOM, and the real-export test (skipped unless `NOTION_EXPORT` is set; set `NOTION_EXPECT` to a JSON file outside the repo for exact counts).
 
 ## Fixtures
 
 - `fixtures/<source>/`: small **synthetic** fixtures, committed. They mirror the real export structure but contain made-up content.
+  - `fixtures/notion/`: two databases in separate `ExportBlock` folders (Recipes, Ingredients) with a relation each way, a BOM, `.csv` and `_all.csv` (the view hides one column), a date, a date range, a multi-select, row pages with property blocks, an image, a `data:` image, a page with no CSV row, a CSV row with no page, an untitled row, a relation to a page that is not in the export, text that names rows of another database, and a standalone page with `<aside>` callouts. Ids are made up (md5 of a label).
 - Real exports are **never committed**. Tests that use them read a path from an env var and skip when it's unset:
   - `TOLARIA_VAULT`: a Tolaria vault folder
   - `NOTION_EXPORT`: an unzipped Notion "Markdown & CSV" export folder
