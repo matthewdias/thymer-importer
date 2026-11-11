@@ -11,6 +11,8 @@ Run with `npm test` (Node 20+, no dependencies).
 - `smoke.test.mjs`: plugin loads, CSV parsing.
 - `link-index.test.mjs`: `LinkIndex` alias resolution (path, slug, Notion id, title, ambiguity).
 - `engine.test.mjs`: `applyImportPlan()` against the fake (collections, dedupe, links, unresolved links, multi-value references, assets, journal, failure isolation).
+- `tolaria.test.mjs`: `parseTolariaVault()` over `fixtures/tolaria` (plan snapshots, directory-handle and file-list input, parent-folder pick, idempotent re-import on the fake, dialog glue with a DOM stub).
+- `tolaria-real.test.mjs`: the same parser + `applyImportPlan()` over a real vault; skipped unless `TOLARIA_VAULT` is set. Prints a count summary only.
 
 ## Fixtures
 

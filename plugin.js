@@ -2034,10 +2034,11 @@ class Plugin extends AppPlugin {
                     <option value="obsidian">Obsidian</option>
                     <option value="joplin">Joplin (YAML)</option>
                     <option value="logseq">Logseq</option>
+                    <option value="tolaria">Tolaria</option>
                 </select>
             </div>
 
-            <div style="margin-bottom: 16px;">
+            <div id="md-collection-container" style="margin-bottom: 16px;">
                 <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Select Collection:</label>
                 <select id="md-collection-select" style="width: 100%; padding: 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text};">
                     <option value="">-- Select a collection --</option>
@@ -2063,7 +2064,7 @@ class Plugin extends AppPlugin {
                 <div id="folder-info" style="margin-top: 8px; font-size: 12px; color: ${colors.textSecondary};"></div>
             </div>
             
-            <div style="margin-bottom: 16px; padding: 16px; background: ${colors.backgroundSecondary}; border-radius: 6px; border: 1px solid ${colors.border};">
+            <div id="md-journal-container" style="margin-bottom: 16px; padding: 16px; background: ${colors.backgroundSecondary}; border-radius: 6px; border: 1px solid ${colors.border};">
                 <label style="display: flex; align-items: center; cursor: pointer; user-select: none;">
                     <input type="checkbox" id="import-journals-checkbox" style="margin-right: 8px; cursor: pointer;">
                     <span style="font-weight: 500; color: ${colors.text};">Import daily notes to Journal</span>
@@ -2101,7 +2102,17 @@ class Plugin extends AppPlugin {
         const importBtn = dialog.querySelector('#md-import-btn');
         const journalCheckbox = dialog.querySelector('#import-journals-checkbox');
         const journalFolderContainer = dialog.querySelector('#journal-folder-container');
+        const sourceSelect = dialog.querySelector('#md-source-select');
         let selectedDirHandle = null;
+
+        // Tolaria builds its collections from the vault's types, so there is no target collection to pick
+        sourceSelect.addEventListener('change', () => {
+            const tolaria = sourceSelect.value === 'tolaria';
+            dialog.querySelector('#md-collection-container').style.display = tolaria ? 'none' : '';
+            dialog.querySelector('#md-journal-container').style.display = tolaria ? 'none' : '';
+            newCollectionNameContainer.style.display = !tolaria && collectionSelect.value === '__CREATE_NEW__' ? 'block' : 'none';
+            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, tolaria);
+        });
 
         // Toggle journal folder input visibility
         journalCheckbox.addEventListener('change', () => {
@@ -2114,7 +2125,7 @@ class Plugin extends AppPlugin {
             } else {
                 newCollectionNameContainer.style.display = 'none';
             }
-            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, sourceSelect.value === 'tolaria');
         });
 
         dialog.querySelector('#select-folder-btn').onclick = async () => {
@@ -2137,7 +2148,7 @@ class Plugin extends AppPlugin {
                 }
                 folderInfo.style.color = colors.success;
 
-                this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+                this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, sourceSelect.value === 'tolaria');
             } catch (error) {
                 if (error.name !== 'AbortError') {
                     console.error('[MD Import] Error selecting folder:', error);
@@ -2163,9 +2174,9 @@ class Plugin extends AppPlugin {
         };
     }
 
-    updateImportButtonState(importBtn, collectionSelect, selectedDirHandle) {
+    updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, skipCollection = false) {
         const hasFolder = selectedDirHandle !== null;
-        const hasCollection = collectionSelect.value !== '';
+        const hasCollection = skipCollection || collectionSelect.value !== '';
         
         if (hasFolder && hasCollection) {
             importBtn.disabled = false;
@@ -2197,6 +2208,9 @@ class Plugin extends AppPlugin {
 
         const collectionGuid = select.value;
         const source = sourceSelect.value;
+        if (source === 'tolaria') {
+            return this.performTolariaImport(dialog, overlay, dirHandle);
+        }
         const isCreatingNew = collectionGuid === '__CREATE_NEW__';
         const importToJournal = journalCheckbox.checked;
         const journalFolderName = journalFolderInput.value.trim();
@@ -3725,6 +3739,633 @@ class Plugin extends AppPlugin {
             .replace(/[^a-z0-9]+/g, '_')
             .replace(/^_|_$/g, '');
     }
+
+    // ===== Tolaria source =====
+    // Imports a Tolaria vault (flat *.md files with YAML frontmatter). Everything here builds on the
+    // ImportPlan engine below: parseTolariaVault() is the only part that reads files and returns a plan,
+    // performTolariaImport() is the dialog glue (parse -> applyImportPlan -> report).
+    //
+    // Mapping:
+    //   `type: Type` notes      -> collection definitions (never records); only types with notes become collections
+    //   other notes             -> records, in the collection of their `type:` (untyped -> "Notes")
+    //   related_to / belongs_to -> multi-value record fields (planPropertyLink); target only if unambiguous
+    //   [[slug]] / [[slug|x]]   -> planBodyLink (resolved by filename slug); code spans/fences are left alone
+    //   ![alt](attachments/x)   -> planAsset
+    //   _* keys, visible, color -> dropped (Tolaria UI state)
+    // plan.parseReport carries parse-time facts (skipped files, unused types, ...) next to the plan.
+    // =========================================================================
+
+    /**
+     * Lists the files of a picked folder (File System Access handle, or { kind: 'filelist', files } from the
+     * webkitdirectory fallback) as [{ path, name, handle }], with `path` relative to the vault root.
+     * If the picked folder holds no .md files itself (the parent of vault + Settings), the child folder
+     * with the most .md files is used. Dot-entries and node_modules are never entered.
+     */
+    async _tolariaListFiles(source) {
+        const skipName = (n) => n.startsWith('.') || n === 'node_modules';
+        const isMd = (n) => /\.md$/i.test(n);
+        const ignoredFolders = new Set();
+        const files = [];
+        let root = '';
+
+        if (source && source.kind === 'filelist') {
+            const entries = [];
+            for (const file of source.files || []) {
+                if (!file || !file.name) continue;
+                const parts = String(file.webkitRelativePath || file.name).split('/').filter(Boolean);
+                if (parts.length) entries.push({ parts, file });
+            }
+            const hasPickedRoot = entries.length > 0 && entries.every(e => e.parts.length > 1);
+            if (hasPickedRoot) root = entries[0].parts[0];
+            let rel = entries.map(e => ({ parts: hasPickedRoot ? e.parts.slice(1) : e.parts, file: e.file }));
+            for (const e of rel) if (e.parts.length > 1 && skipName(e.parts[0])) ignoredFolders.add(e.parts[0]);
+
+            if (!rel.some(e => e.parts.length === 1 && isMd(e.parts[0]) && !skipName(e.parts[0]))) {
+                const counts = new Map();
+                for (const e of rel) {
+                    if (e.parts.length === 2 && isMd(e.parts[1]) && !skipName(e.parts[0])) counts.set(e.parts[0], (counts.get(e.parts[0]) || 0) + 1);
+                }
+                const best = Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0];
+                if (best) {
+                    root = best[0];
+                    for (const e of rel) if (e.parts.length > 1 && e.parts[0] !== best[0] && !skipName(e.parts[0])) ignoredFolders.add(e.parts[0]);
+                    rel = rel.filter(e => e.parts[0] === best[0]).map(e => ({ parts: e.parts.slice(1), file: e.file }));
+                    for (const e of rel) if (e.parts.length > 1 && skipName(e.parts[0])) ignoredFolders.add(e.parts[0]);
+                }
+            }
+            for (const e of rel) {
+                if (e.parts.length === 0 || e.parts.some(skipName)) continue;
+                files.push({ path: e.parts.join('/'), name: e.parts[e.parts.length - 1], handle: e.file });
+            }
+            return { root, files, ignoredFolders: Array.from(ignoredFolders).sort() };
+        }
+
+        if (!source || typeof source.values !== 'function') throw new Error('Tolaria import needs a folder');
+        root = source.name || '';
+        let vault = source;
+        const top = [];
+        for await (const entry of source.values()) top.push(entry);
+        if (!top.some(e => e.kind === 'file' && isMd(e.name) && !skipName(e.name))) {
+            let best = null;
+            for (const dir of top.filter(e => e.kind === 'directory' && !skipName(e.name))) {
+                let n = 0;
+                for await (const child of dir.values()) if (child.kind === 'file' && isMd(child.name) && !skipName(child.name)) n++;
+                if (n > 0 && (!best || n > best.n || (n === best.n && dir.name < best.dir.name))) best = { dir, n };
+            }
+            if (best) {
+                vault = best.dir;
+                root = best.dir.name;
+                for (const e of top) if (e.kind === 'directory' && e !== best.dir) ignoredFolders.add(e.name);
+            }
+        }
+        const walk = async (dir, prefix) => {
+            for await (const entry of dir.values()) {
+                if (skipName(entry.name)) {
+                    if (entry.kind === 'directory' && !prefix) ignoredFolders.add(entry.name);
+                    continue;
+                }
+                const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+                if (entry.kind === 'directory') await walk(entry, path);
+                else if (entry.kind === 'file') files.push({ path, name: entry.name, handle: entry });
+            }
+        };
+        await walk(vault, '');
+        return { root, files, ignoredFolders: Array.from(ignoredFolders).sort() };
+    }
+
+    _tolariaScalar(raw) {
+        const s = String(raw).trim();
+        let m = s.match(/^"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/);
+        if (m) return m[1].replace(/\\(["\\])/g, '$1').replace(/\\n/g, '\n');
+        m = s.match(/^'((?:[^']|'')*)'\s*(?:#.*)?$/);
+        if (m) return m[1].replace(/''/g, "'");
+        const plain = s.replace(/\s+#.*$/, '').trim();
+        return (plain === 'null' || plain === '~') ? null : plain;
+    }
+
+    /**
+     * Frontmatter + body. Handles what Tolaria writes: quoted/plain scalars, `[a, b]`, block lists, `null`,
+     * `|` / `>` blocks, keys with spaces (`sidebar label`). Nested maps are ignored. Values stay strings
+     * (true/false/numbers are not converted); lists stay arrays. The existing parseYAML keeps list-item quotes,
+     * which breaks `- "[[slug]]"`, hence this parser.
+     */
+    _tolariaParseNote(raw) {
+        const text = String(raw == null ? '' : raw).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+        const m = text.match(/^---[ \t]*\n(?:([\s\S]*?)\n)?---[ \t]*(?:\n|$)/);
+        if (!m) return { frontmatter: {}, body: text, hasFrontmatter: false };
+        const frontmatter = {};
+        const lines = m[1] ? m[1].split('\n') : [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line.trim() || /^\s*#/.test(line) || /^\s/.test(line) || /^-(\s|$)/.test(line)) continue;
+            const km = line.match(/^("[^"]*"|'[^']*'|[^:]+?)\s*:(?:[ \t]+(.*))?$/);
+            if (!km) continue;
+            const key = this._tolariaScalar(km[1]);
+            if (!key) continue;
+            const value = (km[2] || '').trim();
+            if (value === '' || /^[|>][+-]?$/.test(value)) {
+                const block = [];
+                let j = i + 1;
+                while (j < lines.length && (lines[j].trim() === '' || /^\s/.test(lines[j]) || /^-(\s|$)/.test(lines[j]))) block.push(lines[j++]);
+                i = j - 1;
+                if (value !== '') {
+                    frontmatter[key] = block.map(l => l.trim()).join(value[0] === '|' ? '\n' : ' ').trim();
+                    continue;
+                }
+                const items = block.map(l => l.match(/^\s*-\s+(.*)$/)).filter(Boolean).map(mm => this._tolariaScalar(mm[1])).filter(v => v !== null && v !== '');
+                frontmatter[key] = items.length ? items : null;
+            } else if (value.startsWith('[') && !value.startsWith('[[') && /\]\s*(?:#.*)?$/.test(value)) {
+                const inner = value.replace(/\]\s*(?:#.*)?$/, '').slice(1);
+                frontmatter[key] = this._tolariaSplitFlowList(inner).map(p => this._tolariaScalar(p)).filter(v => v !== null && v !== '');
+            } else {
+                frontmatter[key] = this._tolariaScalar(value);
+            }
+        }
+        return { frontmatter, body: text.slice(m[0].length), hasFrontmatter: true };
+    }
+
+    /** Splits the inside of a YAML flow list on commas that are outside quotes. */
+    _tolariaSplitFlowList(inner) {
+        const parts = [];
+        let current = '';
+        let quote = null;
+        for (let i = 0; i < inner.length; i++) {
+            const ch = inner[i];
+            if (quote) {
+                current += ch;
+                if (ch === '\\' && quote === '"') current += inner[++i] || '';
+                else if (ch === quote) quote = null;
+            } else if (ch === '"' || ch === "'") {
+                quote = ch;
+                current += ch;
+            } else if (ch === ',') {
+                parts.push(current);
+                current = '';
+            } else {
+                current += ch;
+            }
+        }
+        parts.push(current);
+        return parts.map(p => p.trim()).filter(Boolean);
+    }
+
+    /** Title from the first `# H1` (outside code fences); the H1 line is removed when it opens the note. */
+    _tolariaSplitTitle(body) {
+        const lines = String(body).split('\n');
+        const h1 = /^#[ \t]+(.+?)[ \t]*#*[ \t]*$/;
+        const first = lines.findIndex(l => l.trim() !== '');
+        if (first !== -1 && h1.test(lines[first])) {
+            let end = first + 1;
+            while (end < lines.length && lines[end].trim() === '') end++;
+            return { title: lines[first].match(h1)[1].trim(), body: lines.slice(end).join('\n').trimEnd() };
+        }
+        let fence = null;
+        for (const line of lines) {
+            const f = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+            if (f) { fence = !fence ? f[1] : (f[1][0] === fence[0] && f[1].length >= fence.length ? null : fence); continue; }
+            if (!fence && h1.test(line)) return { title: line.match(h1)[1].trim(), body: String(body).trim() };
+        }
+        return { title: '', body: String(body).trim() };
+    }
+
+    /** Applies fn(text) to every part of `text` that is outside fenced blocks and inline code spans. */
+    _tolariaMapOutsideCode(text, fn) {
+        const chunks = [];
+        let current = null;
+        let fence = null;
+        for (const line of String(text).split('\n')) {
+            const f = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+            const closes = fence && f && f[1][0] === fence[0] && f[1].length >= fence.length && line.trim() === f[1];
+            const opens = !fence && f;
+            const code = !!fence || !!opens;
+            if (!current || current.code !== code) { current = { code, lines: [] }; chunks.push(current); }
+            current.lines.push(line);
+            if (closes) fence = null;
+            else if (opens) fence = f[1];
+        }
+        return chunks.map(c => c.code ? c.lines.join('\n') : this._tolariaMapInline(c.lines.join('\n'), fn)).join('\n');
+    }
+
+    _tolariaMapInline(text, fn) {
+        let out = '';
+        let plain = '';
+        let i = 0;
+        while (i < text.length) {
+            if (text[i] !== '`') { plain += text[i++]; continue; }
+            let n = 0;
+            while (text[i + n] === '`') n++;
+            const fenceStr = '`'.repeat(n);
+            let j = i + n;
+            let close = -1;
+            while ((j = text.indexOf(fenceStr, j)) !== -1) {
+                let k = j;
+                while (text[k] === '`') k++;
+                if (k - j === n) { close = j; break; }
+                j = k;
+            }
+            if (close === -1) { plain += text.slice(i, i + n); i += n; continue; }
+            out += fn(plain) + text.slice(i, close + n);
+            plain = '';
+            i = close + n;
+        }
+        return out + fn(plain);
+    }
+
+    // Phosphor names Tolaria uses that Tabler spells differently (only ones known to exist in Tabler).
+    _tolariaIconAliases() {
+        return {
+            'calendar-blank': 'calendar', 'arrows-clockwise': 'refresh', 'check-circle': 'circle-check', 'x-circle': 'circle-x',
+            'house': 'home', 'magnifying-glass': 'search', 'gear': 'settings', 'lightning': 'bolt', 'lightbulb': 'bulb',
+            'bookmark-simple': 'bookmark', 'note-pencil': 'notes', 'notepad': 'notes', 'pencil-simple': 'pencil',
+            'users-three': 'users-group', 'folder-simple': 'folder', 'chat-circle': 'message-circle', 'envelope': 'mail',
+            'globe': 'world', 'list-checks': 'list-check', 'graduation-cap': 'school', 'wrench': 'tool', 'image': 'photo',
+            'desktop': 'device-desktop', 'laptop': 'device-laptop', 'fire': 'flame', 'drop': 'droplet', 'film-strip': 'movie',
+            'music-note': 'music', 'airplane': 'plane', 'bicycle': 'bike', 'cooking-pot': 'tools-kitchen-2'
+        };
+    }
+
+    /** `_icon` (a Tolaria icon name) -> { icon: 'ti-*', fallback } ; falls back when the name is not a Tabler icon. */
+    _tolariaIcon(name, iconExists, fallback = 'ti-notebook') {
+        const raw = String(name == null ? '' : name).trim().toLowerCase().replace(/^ti-/, '');
+        if (!raw || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(raw)) return { icon: fallback, fallback: !!raw };
+        const alias = this._tolariaIconAliases()[raw];
+        // With a probe the name is tried as written first; without one an aliased name is assumed to be Phosphor-only.
+        const candidates = !alias ? [raw] : (iconExists ? [raw, alias] : [alias]);
+        for (const candidate of candidates) {
+            if (!iconExists || iconExists(`ti-${candidate}`)) return { icon: `ti-${candidate}`, fallback: false };
+        }
+        return { icon: fallback, fallback: true };
+    }
+
+    _tolariaPluralize(word) {
+        const w = String(word).trim();
+        if (!w) return w;
+        if (/[^aeiou]y$/i.test(w)) return `${w.slice(0, -1)}ies`;
+        if (/(s|x|z|ch|sh)$/i.test(w)) return `${w}es`;
+        return `${w}s`;
+    }
+
+    _tolariaTitleCase(text) {
+        return String(text).replace(/[-_]+/g, ' ').trim().replace(/\b[a-z]/g, c => c.toUpperCase());
+    }
+
+    _tolariaFirst(value) {
+        return Array.isArray(value) ? (value[0] == null ? '' : String(value[0])) : (value == null ? '' : String(value));
+    }
+
+    /** "[[slug|label#x]]" -> { ref, label } ; null when the string is not a lone wikilink. */
+    _tolariaParseWikilink(text) {
+        const m = String(text).trim().match(/^\[\[([^\[\]]+)\]\]$/);
+        return m ? this._tolariaSplitWikilink(m[1]) : null;
+    }
+
+    _tolariaSplitWikilink(inner) {
+        const parts = String(inner).split(/\\?\|/);
+        return { ref: parts[0].trim(), label: parts.length > 1 ? parts.slice(1).join('|').trim() || undefined : undefined };
+    }
+
+    /**
+     * Reads a Tolaria vault and returns an ImportPlan (see the engine section). Only reads files.
+     * source: directory handle | { kind: 'filelist', files }
+     * opts.iconExists(name 'ti-*') -> boolean   optional check that an icon exists (the dialog probes the DOM)
+     * plan.parseReport: { vault, filesRead, typeDefinitions, unusedTypes, undefinedTypes, untypedNotes, skipped,
+     *                     droppedKeys, mergedKeys, iconFallbacks, unreferencedAttachments, missingAssets,
+     *                     linksToTypeDefinitions, unreadable, warnings }
+     */
+    async parseTolariaVault(source, opts = {}) {
+        const iconExists = typeof opts.iconExists === 'function' ? opts.iconExists : null;
+        const listing = await this._tolariaListFiles(source);
+        const byPath = new Map(listing.files.map(f => [f.path, f]));
+        const byLowerPath = new Map(listing.files.map(f => [f.path.toLowerCase(), f]));
+        const byPathOrder = (a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+        const plan = this.createImportPlan('tolaria');
+        const report = {
+            vault: { root: listing.root, ignoredFolders: listing.ignoredFolders },
+            filesRead: 0, typeDefinitions: [], unusedTypes: [], undefinedTypes: [], untypedNotes: [], skipped: [],
+            droppedKeys: {}, mergedKeys: {}, iconFallbacks: [], unreferencedAttachments: [], missingAssets: [],
+            linksToTypeDefinitions: 0, unreadable: [], warnings: []
+        };
+        plan.parseReport = report;
+
+        // ---- 1. read every note --------------------------------------------------------------------
+        const AGENT_DOCS = new Set(['agents.md', 'claude.md', 'gemini.md', 'license.md']);
+        const defs = [];
+        const notes = [];
+        for (const file of listing.files.filter(f => /\.md$/i.test(f.name)).sort(byPathOrder)) {
+            if (file.path.split('/').slice(0, -1).some(seg => seg.toLowerCase() === 'attachments')) {
+                report.skipped.push({ path: file.path, reason: 'attachments' });
+                continue;
+            }
+            let parsed;
+            try {
+                parsed = this._tolariaParseNote(await (await this.getFileFromHandle(file.handle)).text());
+            } catch (error) {
+                report.unreadable.push({ path: file.path, message: String(error && error.message || error) });
+                continue;
+            }
+            report.filesRead++;
+            const type = this._tolariaFirst(parsed.frontmatter.type).trim();
+            if (!file.path.includes('/') && AGENT_DOCS.has(file.name.toLowerCase())) {
+                report.skipped.push(omitUndefined({ path: file.path, reason: 'agent-doc', type: type || undefined }));
+                continue;
+            }
+            const slug = file.name.replace(/\.md$/i, '');
+            const split = this._tolariaSplitTitle(parsed.body);
+            const entry = { file, slug, frontmatter: parsed.frontmatter, type, title: split.title, body: split.body };
+            (type.toLowerCase() === 'type' ? defs : notes).push(entry);
+        }
+
+        // ---- 2. type definitions -> collection definitions -----------------------------------------
+        const typeDefs = [];
+        const defsByName = new Map();
+        for (const d of defs) {
+            const fm = d.frontmatter;
+            const name = d.title || this._tolariaTitleCase(d.slug);
+            const label = this._tolariaFirst(fm['sidebar label'] !== undefined ? fm['sidebar label'] : (fm._sidebar_label !== undefined ? fm._sidebar_label : fm.sidebar_label)).trim();
+            const order = parseFloat(this._tolariaFirst(fm._order));
+            const def = {
+                key: '', path: d.file.path, slug: d.slug, name, singular: name,
+                collectionName: label || this._tolariaPluralize(name),
+                iconName: this._tolariaFirst(fm._icon).trim(),
+                description: d.body.replace(/\[\[([^\]]+)\]\]/g, (_, inner) => { const w = this._tolariaSplitWikilink(inner); return w.label || w.ref; }).replace(/\s+/g, ' ').trim(),
+                order: Number.isFinite(order) ? order : Infinity, count: 0, meta: d.slug.toLowerCase() === 'type' || name.toLowerCase() === 'type'
+            };
+            typeDefs.push(def);
+            for (const n of [name, d.slug]) defsByName.set(LinkIndex.normalizeTitle(n), def);
+        }
+        const typeSlugs = new Set(typeDefs.map(d => d.slug.toLowerCase()));
+
+        // ---- 3. assign notes to collections ---------------------------------------------------------
+        const usedKeys = new Set();
+        const uniqueKey = (base) => { let k = base || 'collection'; let i = 2; while (usedKeys.has(k)) k = `${base}_${i++}`; usedKeys.add(k); return k; };
+        const synthetic = new Map();   // normalized type name -> def for types without a definition
+        let untypedDef = null;
+        for (const note of notes) {
+            let def = note.type ? defsByName.get(LinkIndex.normalizeTitle(note.type)) : null;
+            if (def && def.meta) def = null;
+            if (!def && note.type) {
+                const norm = LinkIndex.normalizeTitle(note.type);
+                if (!synthetic.has(norm)) {
+                    synthetic.set(norm, { key: '', path: '', slug: this.slugify(note.type), name: note.type, singular: note.type, collectionName: this._tolariaPluralize(note.type), iconName: '', description: '', order: Infinity, count: 0, synthetic: true });
+                    report.undefinedTypes.push(note.type);
+                }
+                def = synthetic.get(norm);
+            }
+            if (!def) {
+                if (!untypedDef) {
+                    untypedDef = typeDefs.find(d => !d.meta && d.collectionName.toLowerCase() === 'notes')
+                        || { key: '', path: '', slug: 'notes', name: 'Note', singular: 'Note', collectionName: 'Notes', iconName: '', description: 'Notes imported from Tolaria that have no type', order: Infinity, count: 0, synthetic: true };
+                }
+                def = untypedDef;
+                report.untypedNotes.push(note.file.path);
+            }
+            def.count++;
+            note.def = def;
+        }
+        const collectionDefs = [...typeDefs.filter(d => !d.meta), ...synthetic.values(), ...(untypedDef && untypedDef.synthetic ? [untypedDef] : [])]
+            .filter(d => d.count > 0)
+            .sort((a, b) => (a.order - b.order) || (a.collectionName < b.collectionName ? -1 : a.collectionName > b.collectionName ? 1 : 0));
+        report.unusedTypes = typeDefs.filter(d => !d.meta && d.count === 0).sort((a, b) => (a.order - b.order) || (a.name < b.name ? -1 : 1)).map(d => d.name);
+        for (const d of collectionDefs) d.key = uniqueKey(this.slugify(d.collectionName) || this.slugify(d.slug));
+        for (const d of typeDefs.filter(d => !d.meta)) {
+            const icon = this._tolariaIcon(d.iconName, iconExists);
+            d.icon = icon.icon;
+            if (icon.fallback && d.count > 0) report.iconFallbacks.push({ type: d.name, requested: d.iconName });
+            report.typeDefinitions.push({ name: d.name, slug: d.slug, path: d.path, collection: d.count > 0 ? d.key : null, notes: d.count, icon: d.icon });
+        }
+        for (const d of [...synthetic.values(), ...(untypedDef && untypedDef.synthetic ? [untypedDef] : [])]) d.icon = 'ti-notebook';
+
+        // ---- 4. properties: one decision per key, merged case-insensitively -------------------------
+        const DROP = new Set(['visible', 'color', 'title']);
+        const RELATION_KEYS = new Set(['related_to', 'belongs_to']);
+        const props = new Map();       // field id -> { id, variants, items, list, relationKey }
+        const noteProps = new Map();   // note -> Map(field id -> raw value)
+        const fieldIds = new Map();    // lowercased key -> id
+        for (const note of notes) {
+            const mine = new Map();
+            noteProps.set(note, mine);
+            for (const [key, raw] of Object.entries(note.frontmatter)) {
+                const lower = key.trim().toLowerCase();
+                if (lower === 'type') continue;
+                if (lower.startsWith('_') || DROP.has(lower)) { report.droppedKeys[key] = (report.droppedKeys[key] || 0) + 1; continue; }
+                const items = (Array.isArray(raw) ? raw : [raw]).filter(v => v !== null && v !== undefined && String(v).trim() !== '').map(v => String(v).trim());
+                if (items.length === 0) continue;
+                if (!fieldIds.has(lower)) {
+                    let id = this.slugify(lower) || `field_${fieldIds.size + 1}`;
+                    if (id === 'source_path') id = 'source_path_value';
+                    fieldIds.set(lower, id);
+                }
+                const id = fieldIds.get(lower);
+                if (!props.has(id)) props.set(id, { id, variants: new Set(), items: [], list: false });
+                const prop = props.get(id);
+                prop.variants.add(key.trim());
+                prop.items.push(...items);
+                if (Array.isArray(raw)) prop.list = true;
+                if (!mine.has(id)) mine.set(id, items);
+            }
+        }
+        for (const prop of props.values()) {
+            const lower = Array.from(prop.variants)[0].toLowerCase();
+            if (prop.variants.size > 1) report.mergedKeys[prop.id] = Array.from(prop.variants).sort();
+            const label = Array.from(prop.variants).find(v => /[A-Z]/.test(v) && !v.includes('_')) || (lower === 'url' ? 'URL' : this._tolariaTitleCase(lower));
+            prop.label = label.trim() === label.trim().toLowerCase() ? this._tolariaTitleCase(label) : label.trim();
+            if (RELATION_KEYS.has(prop.id) || prop.items.every(v => this._tolariaParseWikilink(v))) { prop.type = 'record'; prop.many = true; }
+            else if (prop.id === 'status' || prop.id === 'kind') { prop.type = 'choice'; prop.many = prop.list; }
+            else if (prop.id === 'url') { prop.type = 'url'; prop.many = prop.list; }
+            else if (!prop.list && prop.items.every(v => /^-?\d+(\.\d+)?$/.test(v))) { prop.type = 'number'; prop.many = false; }
+            else if (!prop.list && prop.items.every(v => /^\d{4}-\d{2}-\d{2}$/.test(v))) { prop.type = 'datetime'; prop.many = false; }
+            else { prop.type = 'text'; prop.many = prop.list; }
+        }
+
+        // ---- 5. collections and records (bodies come after, once the link index exists) -------------
+        const colByKey = new Map();
+        for (const d of collectionDefs) {
+            const col = { key: d.key, name: d.collectionName, icon: d.icon, description: d.description || `Imported from Tolaria (${d.name})`, itemName: d.singular, fields: [] };
+            colByKey.set(d.key, col);
+            plan.collections.push(col);
+        }
+        const recordOf = new Map();
+        for (const note of notes) {
+            const col = colByKey.get(note.def.key);
+            const fmTitle = this._tolariaFirst(note.frontmatter.title).trim();
+            const record = { key: note.file.path, collection: col.key, title: note.title || fmTitle || this._tolariaTitleCase(note.slug), sourcePath: note.file.path, values: {}, body: '' };
+            plan.records.push(record);
+            recordOf.set(note, record);
+            for (const [id, items] of noteProps.get(note)) {
+                const prop = props.get(id);
+                if (!col.fields.some(f => f.id === id)) {
+                    col.fields.push(omitUndefined({ id, label: prop.label, type: prop.type, many: prop.many || undefined }));
+                }
+                if (prop.type === 'record') continue;
+                record.values[id] = prop.type === 'number' ? Number(items[0]) : (prop.many ? items : items[0]);
+            }
+        }
+        // Relations need a LinkIndex over the finished records so `target` can be decided.
+        const index = LinkIndex.fromPlan(plan);
+        const targetsOf = new Map();   // collection key + field -> Set(target collection keys)
+        for (const note of notes) {
+            const record = recordOf.get(note);
+            for (const [id, items] of noteProps.get(note)) {
+                if (props.get(id).type !== 'record') continue;
+                for (const item of items) {
+                    const wiki = this._tolariaParseWikilink(item);
+                    const ref = wiki ? wiki.ref : item;
+                    this.planPropertyLink(plan, record.key, id, { ref }, { raw: item });
+                    const hit = index.resolve({ ref }, { fromKey: record.key });
+                    if (hit.status === 'resolved') {
+                        const k = `${record.collection}\u0000${id}`;
+                        if (!targetsOf.has(k)) targetsOf.set(k, new Set());
+                        targetsOf.get(k).add(index.records.get(hit.key).collection);
+                    } else if (typeSlugs.has(LinkIndex.slugOf(ref))) {
+                        report.linksToTypeDefinitions++;
+                    }
+                }
+            }
+        }
+        for (const col of plan.collections) {
+            for (const field of col.fields) {
+                if (field.type !== 'record') continue;
+                const targets = targetsOf.get(`${col.key}\u0000${field.id}`);
+                if (targets && targets.size === 1) field.target = Array.from(targets)[0];
+            }
+        }
+
+        // ---- 6. bodies: wikilinks and local images ---------------------------------------------------
+        const referenced = new Set();
+        const combined = /(!\[((?:\\.|[^\]\\])*)\]\(\s*(<[^>]*>|[^)\s]*)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\))|(\[\[([^\[\]\n]+?)\]\])/g;
+        for (const note of notes) {
+            const record = recordOf.get(note);
+            const dir = note.file.path.split('/').slice(0, -1).join('/');
+            record.body = this._tolariaMapOutsideCode(note.body, (text) => text.replace(combined, (match, image, alt, url, wiki, inner) => {
+                if (wiki) {
+                    const link = this._tolariaSplitWikilink(inner);
+                    if (!link.ref) return match;
+                    if (typeSlugs.has(LinkIndex.slugOf(link.ref)) && !index.resolve({ ref: link.ref }, { fromKey: record.key }).key) report.linksToTypeDefinitions++;
+                    return this.planBodyLink(plan, record.key, { ref: link.ref }, { label: link.label, raw: match });
+                }
+                let ref = url.replace(/^<|>$/g, '').replace(/[#?].*$/, '');
+                if (/^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('//') || !ref) return match;
+                try { ref = decodeURIComponent(ref); } catch (e) { /* keep as written */ }
+                const joined = ref.startsWith('/') ? ref.slice(1) : (dir ? `${dir}/${ref}` : ref);
+                const parts = [];
+                for (const seg of joined.split('/')) { if (!seg || seg === '.') continue; if (seg === '..') parts.pop(); else parts.push(seg); }
+                const path = parts.join('/');
+                const file = byPath.get(path) || byLowerPath.get(path.toLowerCase());
+                if (!file) { report.missingAssets.push({ record: record.key, ref: url }); return match; }
+                referenced.add(file.path);
+                return this.planAsset(plan, record.key, {
+                    sourcePath: file.path, name: file.name, raw: match,
+                    readBytes: async () => (await this.getFileFromHandle(file.handle)).arrayBuffer()
+                });
+            }));
+        }
+        report.unreferencedAttachments = listing.files
+            .filter(f => f.path.toLowerCase().startsWith('attachments/') && !/\.md$/i.test(f.name) && !referenced.has(f.path))
+            .map(f => f.path).sort();
+        if (typeDefs.length === 0) report.warnings.push('No Tolaria type definitions (type: Type) found; every note goes by its own `type:` value.');
+        if (plan.records.length === 0) report.warnings.push('No Tolaria notes found in the selected folder.');
+        return plan;
+    }
+
+    /**
+     * Probe for "does this Tabler icon exist": the icon font gives `.ti-name::before` a content value.
+     * Returns { exists(name) | null, dispose() }; exists is null when the probe cannot be trusted.
+     */
+    _tolariaIconProbe() {
+        const none = { exists: null, dispose() {} };
+        try {
+            if (typeof document === 'undefined' || !document.body) return none;
+            const el = document.createElement('i');
+            el.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:-999px';
+            document.body.appendChild(el);
+            const has = (name) => {
+                el.className = `ti ${name}`;
+                const content = getComputedStyle(el, '::before').content;
+                return !!content && content !== 'none' && content !== 'normal' && content !== '""';
+            };
+            const trusted = has('ti-file-text') && !has('ti-no-such-icon-zzz');
+            return { exists: trusted ? has : null, dispose() { el.remove(); } };
+        } catch (error) {
+            return none;
+        }
+    }
+
+    /** Dialog flow for source === 'tolaria': parse the vault, apply the plan, show the report. */
+    async performTolariaImport(dialog, overlay, dirHandle) {
+        const statusDiv = dialog.querySelector('#md-status');
+        const importBtn = dialog.querySelector('#md-import-btn');
+        const cancelBtn = dialog.querySelector('#md-cancel-btn');
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing...';
+        this.showStatus(statusDiv, 'Reading Tolaria vault...', 'info');
+        const probe = this._tolariaIconProbe();
+        try {
+            const plan = await this.parseTolariaVault(dirHandle, { iconExists: probe.exists });
+            if (plan.records.length === 0) {
+                this.showStatus(statusDiv, 'No Tolaria notes found in that folder (expected *.md files with frontmatter).', 'error');
+                importBtn.disabled = false;
+                importBtn.textContent = 'Import';
+                return;
+            }
+            const report = await this.applyImportPlan(plan, {
+                onProgress: ({ message, done, total }) => this.showStatus(statusDiv, total ? `${message} (${done}/${total})` : message, 'info')
+            });
+            this.renderTolariaReport(statusDiv, plan, report);
+            importBtn.textContent = 'Imported';
+            cancelBtn.textContent = 'Close';
+        } catch (error) {
+            console.error('[Tolaria Import] Error:', error);
+            this.showStatus(statusDiv, `Error: ${error.message}`, 'error');
+            importBtn.disabled = false;
+            importBtn.textContent = 'Import';
+        } finally {
+            probe.dispose();
+        }
+    }
+
+    renderTolariaReport(statusDiv, plan, report) {
+        const c = report.counts;
+        const p = plan.parseReport || {};
+        const failed = report.errors.length > 0 || c.recordsFailed > 0;
+        this.showStatus(statusDiv, '', failed ? 'warning' : 'success');
+        statusDiv.style.textAlign = 'left';
+        const add = (tag, text, style = '') => {
+            const el = document.createElement(tag);
+            el.textContent = text;
+            if (style) el.style.cssText = style;
+            statusDiv.appendChild(el);
+            return el;
+        };
+        const list = (items, limit = 30) => {
+            const ul = document.createElement('ul');
+            ul.style.cssText = 'margin: 4px 0 0 0; padding-left: 20px; font-size: 12px;';
+            for (const text of items.slice(0, limit)) { const li = document.createElement('li'); li.textContent = text; ul.appendChild(li); }
+            if (items.length > limit) { const li = document.createElement('li'); li.textContent = `...and ${items.length - limit} more`; ul.appendChild(li); }
+            statusDiv.appendChild(ul);
+        };
+        add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
+        add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
+        add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
+        add('div', `Links: ${c.linksResolved} resolved, ${c.linksUnresolved} unresolved`);
+        add('div', `Images: ${c.assetsUploaded} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`);
+        if (p.unusedTypes && p.unusedTypes.length) add('div', `Types with no notes (no collection created): ${p.unusedTypes.join(', ')}`, 'margin-top: 8px; font-size: 12px;');
+        if (p.untypedNotes && p.untypedNotes.length) add('div', `Untyped notes (put in "Notes"): ${p.untypedNotes.join(', ')}`, 'margin-top: 4px; font-size: 12px;');
+        if (p.skipped && p.skipped.length) add('div', `Skipped: ${p.skipped.map(s => s.path).join(', ')}`, 'margin-top: 4px; font-size: 12px;');
+        if (report.unresolvedLinks.length) {
+            add('div', 'Unresolved links (left as text):', 'margin-top: 8px; font-weight: 600; font-size: 12px;');
+            const typeSlugs = new Set((p.typeDefinitions || []).map(d => String(d.slug).toLowerCase()));
+            list(report.unresolvedLinks.map(u => {
+                const why = typeSlugs.has(LinkIndex.slugOf(u.ref)) ? 'type definition, not a note' : u.reason;
+                return `${u.fromTitle || u.from}: [[${u.ref}]] (${why})`;
+            }));
+        }
+        if (report.errors.length) {
+            add('div', 'Errors:', 'margin-top: 8px; font-weight: 600; font-size: 12px;');
+            list(report.errors.map(e => `${e.record || e.collection || e.asset || `pass ${e.pass}`}: ${e.message}`));
+        }
+    }
+
+    // ===== end Tolaria source =====
 
     // =========================================================================
     // IMPORT PLAN ENGINE
