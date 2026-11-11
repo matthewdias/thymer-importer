@@ -2034,10 +2034,14 @@ class Plugin extends AppPlugin {
                     <option value="obsidian">Obsidian</option>
                     <option value="joplin">Joplin (YAML)</option>
                     <option value="logseq">Logseq</option>
+                    <option value="notion">Notion export</option>
                 </select>
+                <div id="md-notion-hint" style="display: none; margin-top: 8px; font-size: 12px; color: ${colors.textSecondary};">
+                    Select the unzipped Notion export (Markdown &amp; CSV) folder. Each database becomes a collection and standalone pages go to "Notion Pages".
+                </div>
             </div>
 
-            <div style="margin-bottom: 16px;">
+            <div id="md-collection-container" style="margin-bottom: 16px;">
                 <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Select Collection:</label>
                 <select id="md-collection-select" style="width: 100%; padding: 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text};">
                     <option value="">-- Select a collection --</option>
@@ -2063,7 +2067,7 @@ class Plugin extends AppPlugin {
                 <div id="folder-info" style="margin-top: 8px; font-size: 12px; color: ${colors.textSecondary};"></div>
             </div>
             
-            <div style="margin-bottom: 16px; padding: 16px; background: ${colors.backgroundSecondary}; border-radius: 6px; border: 1px solid ${colors.border};">
+            <div id="md-journal-container" style="margin-bottom: 16px; padding: 16px; background: ${colors.backgroundSecondary}; border-radius: 6px; border: 1px solid ${colors.border};">
                 <label style="display: flex; align-items: center; cursor: pointer; user-select: none;">
                     <input type="checkbox" id="import-journals-checkbox" style="margin-right: 8px; cursor: pointer;">
                     <span style="font-weight: 500; color: ${colors.text};">Import daily notes to Journal</span>
@@ -2108,13 +2112,25 @@ class Plugin extends AppPlugin {
             journalFolderContainer.style.display = journalCheckbox.checked ? 'block' : 'none';
         });
 
+        const sourceSelect = dialog.querySelector('#md-source-select');
+        const isNotion = () => sourceSelect.value === 'notion';
+        // Notion export: collections come from its databases, so there is no collection to choose
+        sourceSelect.addEventListener('change', () => {
+            const notion = isNotion();
+            dialog.querySelector('#md-notion-hint').style.display = notion ? 'block' : 'none';
+            dialog.querySelector('#md-collection-container').style.display = notion ? 'none' : 'block';
+            dialog.querySelector('#md-journal-container').style.display = notion ? 'none' : 'block';
+            newCollectionNameContainer.style.display = !notion && collectionSelect.value === '__CREATE_NEW__' ? 'block' : 'none';
+            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, notion);
+        });
+
         collectionSelect.addEventListener('change', () => {
             if (collectionSelect.value === '__CREATE_NEW__') {
                 newCollectionNameContainer.style.display = 'block';
             } else {
                 newCollectionNameContainer.style.display = 'none';
             }
-            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+            this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, isNotion());
         });
 
         dialog.querySelector('#select-folder-btn').onclick = async () => {
@@ -2137,7 +2153,7 @@ class Plugin extends AppPlugin {
                 }
                 folderInfo.style.color = colors.success;
 
-                this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+                this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, isNotion());
             } catch (error) {
                 if (error.name !== 'AbortError') {
                     console.error('[MD Import] Error selecting folder:', error);
@@ -2163,9 +2179,9 @@ class Plugin extends AppPlugin {
         };
     }
 
-    updateImportButtonState(importBtn, collectionSelect, selectedDirHandle) {
+    updateImportButtonState(importBtn, collectionSelect, selectedDirHandle, collectionOptional = false) {
         const hasFolder = selectedDirHandle !== null;
-        const hasCollection = collectionSelect.value !== '';
+        const hasCollection = collectionOptional || collectionSelect.value !== '';
         
         if (hasFolder && hasCollection) {
             importBtn.disabled = false;
@@ -2197,6 +2213,9 @@ class Plugin extends AppPlugin {
 
         const collectionGuid = select.value;
         const source = sourceSelect.value;
+        if (source === 'notion') {
+            return this.performNotionImport(dialog, overlay, dirHandle);
+        }
         const isCreatingNew = collectionGuid === '__CREATE_NEW__';
         const importToJournal = journalCheckbox.checked;
         const journalFolderName = journalFolderInput.value.trim();
@@ -3724,6 +3743,805 @@ class Plugin extends AppPlugin {
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, '_')
             .replace(/^_|_$/g, '');
+    }
+
+    // =========================================================================
+    // ===== Notion source =====
+    //
+    // parseNotionExport(dirHandle | { kind: 'filelist', files }, options?) -> ImportPlan
+    //
+    // Reads an unzipped Notion "Markdown & CSV" export (the folder that holds the
+    // <uuid>_ExportBlock-<uuid> folders) and returns an ImportPlan; applyImportPlan() does the
+    // Thymer writes. Only file reads happen here. Diagnostics for the UI are in plan.parseReport.
+    //
+    // Layout it understands:
+    //   <dir>/<Database> <32hex>.csv           the view's columns, in view order
+    //   <dir>/<Database> <32hex>_all.csv       every column (used for rows/columns when present)
+    //   <dir>/<Database>/<Row> <32hex>.md      row pages: "# Title", a "Key: value" block that
+    //                                          repeats the CSV (dropped), then the body
+    //   <dir>/<Page> <32hex>.md                anything else -> the "Notion Pages" collection
+    //
+    // options.linkByTitle: ['<collection name>.<column>', ...]  turns a text column that names rows
+    //   of another database into a record reference (matched by exact title). Off by default.
+    // =========================================================================
+
+    _notionSettings() {
+        return {
+            relationMinShare: 0.25,       // share of non-empty cells holding a Notion page id => relation column
+            linkByTitleMinShare: 0.65,    // share of values that exactly name rows of ONE other database => candidate
+            linkByTitleMinValues: 3,
+            choiceMaxOptions: 50,         // a column with more distinct values than this stays text
+            choiceMinReuse: 2,            // ...as does one whose values are used less often than this on average
+            choiceMaxLength: 80,
+            pagesCollectionName: 'Notion Pages'
+        };
+    }
+
+    async parseNotionExport(source, options = {}) {
+        const listed = await this._notionListFiles(source);
+        const input = { files: new Map(), texts: new Map() };
+        for (const f of listed) {
+            input.files.set(f.path, f);
+            if (/\.(md|csv)$/i.test(f.path)) input.texts.set(f.path, await this._notionReadText(f));
+        }
+        return this._notionBuildPlan(input, options);
+    }
+
+    /** Flat [{ path, getFile }] for a directory handle or a pickFolder() file list; paths are relative to the picked folder. */
+    async _notionListFiles(source) {
+        const skip = (name) => name.startsWith('.') || name === '__MACOSX' || name === 'node_modules';
+        const files = [];
+        if (source && source.kind === 'filelist') {
+            for (const file of source.files || []) {
+                if (!file) continue;
+                const parts = String(file.webkitRelativePath || file.name || '').split('/').filter(Boolean);
+                if (parts.length > 1) parts.shift();   // the picked folder's own name
+                if (parts.length === 0 || parts.some(skip)) continue;
+                files.push({ path: parts.join('/').normalize('NFC'), getFile: async () => file });
+            }
+        } else if (source && typeof source.values === 'function') {
+            const walk = async (dir, prefix) => {
+                for await (const entry of dir.values()) {
+                    if (skip(entry.name)) continue;
+                    const p = prefix ? `${prefix}/${entry.name}` : entry.name;
+                    if (entry.kind === 'directory') await walk(entry, p);
+                    else if (entry.kind === 'file') files.push({ path: p.normalize('NFC'), getFile: () => entry.getFile() });
+                }
+            };
+            await walk(source, '');
+        } else {
+            throw new TypeError('parseNotionExport: expected a directory handle or a { kind: "filelist", files } result');
+        }
+        return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    }
+
+    async _notionReadText(entry) {
+        const file = await entry.getFile();
+        const text = typeof file.text === 'function' ? await file.text() : await this.readFileAsText(file);
+        return String(text).replace(/^﻿/, '');   // Notion CSVs start with a UTF-8 BOM, which parseCSV would keep in the first header
+    }
+
+    _notionIdFromUrl(url) {
+        return LinkIndex.extractNotionId(String(url).split('#')[0].split('?')[0]);   // never the ?v=<view id>
+    }
+
+    _notionIsNotionUrl(url) {
+        return /^https?:\/\/(?:[\w-]+\.)*notion\.(?:so|com|site)(?:[/?#]|$)/i.test(url);
+    }
+
+    _notionNormTitle(s) {
+        return LinkIndex.normalizeTitle(s);
+    }
+
+    _notionResolvePath(dir, rel) {
+        let r = String(rel).split('#')[0].split('?')[0];
+        try { r = decodeURIComponent(r); } catch (e) { /* not URI-encoded */ }
+        const parts = [];
+        for (const seg of `${dir ? dir + '/' : ''}${r}`.normalize('NFC').split('/')) {
+            if (!seg || seg === '.') continue;
+            if (seg === '..') { parts.pop(); continue; }
+            parts.push(seg);
+        }
+        return parts.join('/');
+    }
+
+    _notionIconFor(name) {
+        const map = {
+            '🔲': 'ti-square', '⬛': 'ti-square', '⬜': 'ti-square', '◼️': 'ti-square', '🔳': 'ti-square',
+            '📚': 'ti-books', '📖': 'ti-book', '✅': 'ti-checkbox', '☑️': 'ti-checkbox', '📝': 'ti-notes',
+            '📅': 'ti-calendar', '🗓': 'ti-calendar', '👤': 'ti-user', '👥': 'ti-users', '💡': 'ti-bulb',
+            '📌': 'ti-pin', '🎯': 'ti-target', '🏠': 'ti-home', '💰': 'ti-coin', '🛒': 'ti-shopping-cart',
+            '🔧': 'ti-tool', '🎵': 'ti-music', '📷': 'ti-camera', '✈️': 'ti-plane', '❤️': 'ti-heart',
+            '⭐': 'ti-star', '🔥': 'ti-flame', '📊': 'ti-chart-bar', '📁': 'ti-folder', '🗂': 'ti-folders'
+        };
+        const lead = Array.from(String(name).trim())[0] || '';
+        const withSelector = Array.from(String(name).trim()).slice(0, 2).join('');
+        return map[withSelector] || map[lead] || 'ti-database';
+    }
+
+    // ---- pages ---------------------------------------------------------------
+
+    _notionReadPage(path, text) {
+        const base = path.split('/').pop().replace(/\.md$/i, '');
+        const m = base.match(/^(.*?)\s*([0-9a-f]{32})$/i);
+        const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+        let i = 0;
+        while (i < lines.length && lines[i].trim() === '') i++;
+        let h1 = null;
+        let bodyStart = 0;
+        if (i < lines.length && /^#\s+\S/.test(lines[i])) { h1 = lines[i].replace(/^#\s+/, '').trim(); bodyStart = i + 1; }
+        return {
+            path,
+            dir: path.split('/').slice(0, -1).join('/'),
+            id: m ? m[2].toLowerCase() : null,
+            fileTitle: (m ? m[1] : base).trim(),
+            h1,
+            lines,
+            bodyStart
+        };
+    }
+
+    /** The "Key: value" block under the H1 (only keys that are CSV columns count). Returns { props, bodyLines }. */
+    _notionSplitPropertyBlock(page, headerSet) {
+        let i = page.bodyStart;
+        while (i < page.lines.length && page.lines[i].trim() === '') i++;
+        const props = {};
+        while (i < page.lines.length && page.lines[i].trim() !== '') {
+            const m = page.lines[i].match(/^([^:]+?):(?: (.*))?$/);
+            if (!m || !headerSet.has(m[1].trim())) break;
+            props[m[1].trim()] = (m[2] || '').trim();
+            i++;
+        }
+        if (Object.keys(props).length === 0) return { props, bodyLines: page.lines.slice(page.bodyStart) };
+        return { props, bodyLines: page.lines.slice(i) };
+    }
+
+    // ---- databases -----------------------------------------------------------
+
+    _notionParseCsv(text) {
+        try {
+            return this.parseCSV(text);
+        } catch (e) {
+            // parseCSV insists on a data row; a database with no rows still has a header
+            const header = String(text).split(/\r?\n/)[0] || '';
+            return { headers: header ? header.split(',').map(h => h.replace(/^"|"$/g, '').trim()) : [], rows: [] };
+        }
+    }
+
+    _notionDiscoverDatabases(texts, diag) {
+        const groups = new Map();
+        for (const p of texts.keys()) {
+            if (!/\.csv$/i.test(p)) continue;
+            const stem = p.replace(/(_all)?\.csv$/i, '');
+            const g = groups.get(stem) || { stem, plain: null, all: null };
+            g[/_all\.csv$/i.test(p) ? 'all' : 'plain'] = p;
+            groups.set(stem, g);
+        }
+        const dbs = [];
+        const sortName = (g) => g.stem.split('/').pop().replace(/^[^\p{L}\p{N}]+/u, '').toLowerCase();
+        for (const g of Array.from(groups.values()).sort((a, b) => (sortName(a) < sortName(b) ? -1 : sortName(a) > sortName(b) ? 1 : a.stem < b.stem ? -1 : 1))) {
+            const dir = g.stem.split('/').slice(0, -1).join('/');
+            const base = g.stem.split('/').pop();
+            const m = base.match(/^(.*?)\s+([0-9a-f]{32})$/i);
+            const name = (m ? m[1] : base).trim();
+            const plain = g.plain ? this._notionParseCsv(texts.get(g.plain)) : null;
+            const all = g.all ? this._notionParseCsv(texts.get(g.all)) : null;
+            const primary = all || plain;
+            if (!primary || primary.headers.length === 0) {
+                diag.warnings.push(`${g.plain || g.all}: no header row, skipped`);
+                continue;
+            }
+            const titleHeader = primary.headers[0];
+            // the plain CSV is the view: use its column order, then any columns only _all has
+            const headers = [titleHeader];
+            for (const h of [...(plain ? plain.headers : []), ...(all ? all.headers : [])]) if (!headers.includes(h)) headers.push(h);
+            const rows = primary.rows.map((cells, index) => {
+                const byHeader = {};
+                primary.headers.forEach((h, c) => { byHeader[h] = (cells[c] || '').trim(); });
+                return { index, title: byHeader[titleHeader] || '', cells: byHeader };
+            });
+            const info = {
+                name, plainCsv: g.plain, allCsv: g.all,
+                rowsPlain: plain ? plain.rows.length : null, rowsAll: all ? all.rows.length : null,
+                headersOnlyInAll: all && plain ? all.headers.filter(h => !plain.headers.includes(h)) : [],
+                headersOnlyInPlain: all && plain ? plain.headers.filter(h => !all.headers.includes(h)) : []
+            };
+            if (plain && all) {
+                const have = new Set(all.rows.map(r => this._notionNormTitle(r[0])));
+                info.rowsOnlyInPlain = plain.rows.filter(r => !have.has(this._notionNormTitle(r[0]))).length;
+            }
+            dbs.push({
+                id: m ? m[2].toLowerCase() : null, name, dir, rowsDir: dir ? `${dir}/${name}` : name,
+                titleHeader, headers, rows, info, pages: [], records: [], orphans: []
+            });
+        }
+        // collection names must be unique; keep them readable
+        const seen = new Map();
+        for (const db of dbs) {
+            const n = db.name.toLowerCase();
+            seen.set(n, (seen.get(n) || 0) + 1);
+        }
+        for (const db of dbs) {
+            db.collectionName = seen.get(db.name.toLowerCase()) > 1 && db.id ? `${db.name} (${db.id.slice(0, 4)})` : db.name;
+            db.key = `notion-db:${db.id || db.name}`;
+        }
+        return dbs;
+    }
+
+    /** Pairs CSV rows with row pages: exact title (H1, then filename), then an untitled row with an "Untitled" page. */
+    _notionMatchRows(db) {
+        const free = new Set(db.pages);
+        const take = (row, pred, score) => {
+            const cands = db.pages.filter(p => free.has(p) && pred(p));
+            if (cands.length === 0) return null;
+            let best = cands[0];
+            if (cands.length > 1) {
+                const rank = (p) => Object.entries(p.props || {}).filter(([h, v]) => (row.cells[h] || '') === v).length;
+                best = cands.slice().sort((a, b) => rank(b) - rank(a))[0];
+            }
+            free.delete(best);
+            return best;
+        };
+        const norm = (s) => this._notionNormTitle(s);
+        for (const row of db.rows) row.page = null;
+        for (const row of db.rows) {
+            if (!row.title) continue;
+            row.page = take(row, p => p.h1 !== null && norm(p.h1) === norm(row.title));
+        }
+        for (const row of db.rows) {
+            if (row.page || !row.title) continue;
+            row.page = take(row, p => norm(p.fileTitle) === norm(row.title));
+        }
+        for (const row of db.rows) {
+            if (row.page || row.title) continue;
+            row.page = take(row, p => !p.h1 || norm(p.h1) === 'untitled');
+        }
+        db.orphans = db.pages.filter(p => free.has(p));
+    }
+
+    // ---- columns -------------------------------------------------------------
+
+    _notionParseDate(value) {
+        const s = String(value).trim();
+        const months = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
+        const monthOf = (name) => {
+            const n = String(name).toLowerCase().replace(/\.$/, '');
+            if (months[n]) return months[n];
+            const hit = Object.keys(months).find(k => n.length >= 3 && k.startsWith(n === 'sept' ? 'sep' : n));
+            return hit ? months[hit] : null;
+        };
+        const pad = (n) => String(n).padStart(2, '0');
+        const timePart = (h, mi, ap) => {
+            if (h === undefined) return '';
+            let hh = parseInt(h, 10);
+            if (ap) { hh = hh % 12 + (/^p/i.test(ap) ? 12 : 0); }
+            return `T${pad(hh)}:${mi}`;
+        };
+        let m = s.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
+        if (m && monthOf(m[1])) return `${m[3]}-${pad(monthOf(m[1]))}-${pad(m[2])}${timePart(m[4], m[5], m[6])}`;
+        m = s.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
+        if (m && monthOf(m[2])) return `${m[3]}-${pad(monthOf(m[2]))}-${pad(m[1])}${timePart(m[4], m[5], m[6])}`;
+        m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
+        if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) return `${m[1]}-${pad(m[2])}-${pad(m[3])}${timePart(m[4], m[5], m[6])}`;
+        return null;
+    }
+
+    /** "A → B" (a Notion date range): the start date, plus whether it was a range. */
+    _notionDateCell(cell) {
+        const range = String(cell).split(/\s+→\s+/);
+        const start = this._notionParseDate(range[0]);
+        return start ? { value: start, range: range.length > 1 } : null;
+    }
+
+    /** Splits a relation cell into page ids (from Notion URLs, optionally "Title (url)") and the text left over. */
+    _notionParseRelationCell(cell) {
+        const ids = [];
+        const re = /(?:([^,()]*?)\s*\()?(https?:\/\/[^\s,)]+)\)?/g;
+        let rest = String(cell).replace(re, (all, label, url) => {
+            const id = this._notionIsNotionUrl(url) ? this._notionIdFromUrl(url) : null;
+            if (!id) return all;
+            ids.push({ id, url, label: (label || '').trim() || undefined });
+            return '\u0000';
+        });
+        const text = rest.split(/\u0000|,\s+|,$/).map(t => t.trim()).filter(Boolean);
+        const seen = new Set();
+        return { ids: ids.filter(x => !seen.has(x.id) && seen.add(x.id)), text };
+    }
+
+    _notionSelectTokens(value) {
+        return String(value).split(/,\s+/).map(t => t.trim()).filter(Boolean);
+    }
+
+    /** Works out each column's Thymer type. Returns [{ header, type, many?, target?, ... }]; empty columns are omitted. */
+    _notionAnalyzeColumns(db, ctx) {
+        const cfg = ctx.cfg;
+        const out = [];
+        for (const header of db.headers.slice(1)) {
+            const cells = db.rows.map(r => r.cells[header] || '');
+            const values = cells.filter(Boolean);
+            const col = { header, values: values.length };
+            if (values.length === 0) { db.diag.emptyColumns.push(header); continue; }
+
+            // relation: cells carrying Notion page ids
+            const parsed = cells.map(c => (c ? this._notionParseRelationCell(c) : { ids: [], text: [] }));
+            const withId = parsed.filter(p => p.ids.length > 0).length;
+            const byTitle = ctx.linkByTitle.has(`${db.collectionName}.${header}`.toLowerCase());
+            if (withId / values.length >= cfg.relationMinShare) {
+                const targets = new Map();
+                for (const p of parsed) for (const x of p.ids) {
+                    const hit = ctx.idIndex.get(x.id);
+                    if (hit) targets.set(hit.collection, (targets.get(hit.collection) || 0) + 1);
+                }
+                if (targets.size > 0) {
+                    out.push({
+                        ...col, type: 'record', many: parsed.some(p => p.ids.length + (byTitle ? p.text.length : 0) > 1),
+                        target: targets.size === 1 ? Array.from(targets.keys())[0] : undefined, idShare: withId / values.length, byTitle
+                    });
+                    continue;
+                }
+                db.diag.relationColumnsOutsideExport.push({ column: header, cells: withId });
+            }
+            if (byTitle) {
+                const best = this._notionTitleCandidates(db, header, cells, ctx)[0];
+                if (best) {
+                    out.push({ ...col, type: 'record', many: parsed.some(p => p.text.length > 1), target: best.target, byTitle: true });
+                    continue;
+                }
+                ctx.diag.warnings.push(`linkByTitle ${db.collectionName}.${header}: no other database matches its values; kept as text`);
+            }
+
+            if (values.every(v => /^https?:\/\/\S+$/i.test(v))) { out.push({ ...col, type: 'url' }); continue; }
+
+            const dates = values.map(v => this._notionDateCell(v));
+            if (dates.every(Boolean)) {
+                db.diag.dateRangesTruncated += dates.filter(d => d.range).length;
+                out.push({ ...col, type: 'datetime' });
+                continue;
+            }
+            if (values.every(v => this.coerceNumber(v) !== null)) { out.push({ ...col, type: 'number' }); continue; }
+
+            const tokens = values.map(v => this._notionSelectTokens(v));
+            const flat = tokens.flat();
+            const distinct = new Set(flat);
+            if (distinct.size > 0 && distinct.size <= cfg.choiceMaxOptions && flat.length / distinct.size >= cfg.choiceMinReuse
+                && flat.every(t => t.length <= cfg.choiceMaxLength)) {
+                out.push({ ...col, type: 'choice', many: tokens.some(t => t.length > 1) });
+                continue;
+            }
+            out.push({ ...col, type: 'text' });
+        }
+        return out;
+    }
+
+    /** Other databases whose row titles exactly match most of a column's values: [{ target, collection, share, matched, total }]. */
+    _notionTitleCandidates(db, header, cells, ctx, only = null) {
+        const cfg = ctx.cfg;
+        const values = cells.filter(Boolean);
+        const out = [];
+        if (values.length < cfg.linkByTitleMinValues) return out;
+        for (const other of ctx.dbs) {
+            if (other === db || (only && other.key !== only)) continue;
+            const titles = ctx.titleSets.get(other.key);
+            const matched = values.filter(v => titles.has(v) || (v.includes(', ') && this._notionSelectTokens(v).every(t => titles.has(t)))).length;
+            if (matched / values.length >= cfg.linkByTitleMinShare) {
+                out.push({ target: other.key, targetName: other.collectionName, share: matched / values.length, matched, total: values.length });
+            }
+        }
+        if (out.length === 1) return out;
+        // several databases match: only an explicit linkByTitle request picks the best one
+        return ctx.linkByTitle.has(`${db.collectionName}.${header}`.toLowerCase()) ? out.sort((a, b) => b.share - a.share) : [];
+    }
+
+    // ---- bodies --------------------------------------------------------------
+
+    _notionConvertBody(ctx, rec, lines) {
+        const out = [];
+        let inFence = false;
+        let fenceChar = '';
+        let aside = 0;
+        let needBlank = false;
+        const quote = (line) => {
+            if (!aside) return line;
+            const q = '> '.repeat(aside);
+            return line.trim() === '' ? q.trimEnd() : q + line;
+        };
+        const push = (line) => {
+            if (needBlank) {
+                if (line.trim() !== '') out.push('');
+                needBlank = false;
+            }
+            if (line.trim() === '' && !inFence && out.length && out[out.length - 1].trim() === '') return;   // dropped images leave blank runs
+            out.push(line);
+        };
+        for (const line of lines) {
+            const fence = line.match(/^\s*(`{3,}|~{3,})/);
+            if (fence) {
+                if (!inFence) { inFence = true; fenceChar = fence[1][0]; } else if (fence[1][0] === fenceChar) inFence = false;
+                push(quote(line));
+                continue;
+            }
+            if (inFence) { push(quote(line)); continue; }
+            const open = line.match(/^\s*<aside[^>]*>(.*?)(<\/aside>)?\s*$/i);
+            if (open) {
+                ctx.diag.html.asides++;
+                if (!aside && out.length && out[out.length - 1].trim() !== '') out.push('');
+                needBlank = false;
+                aside++;
+                if (open[1].trim()) push(quote(this._notionRewriteInline(ctx, rec, open[1].trim())));
+                if (open[2]) { aside--; if (!aside) needBlank = true; }
+                continue;
+            }
+            if (/^\s*<\/aside>\s*$/i.test(line)) {
+                aside = Math.max(0, aside - 1);
+                if (!aside) needBlank = true;   // a quote would otherwise swallow the next line
+                continue;
+            }
+            push(quote(this._notionRewriteInline(ctx, rec, line)));
+        }
+        return out.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
+    }
+
+    _notionRewriteInline(ctx, rec, line) {
+        return line.split(/(`+[^`]*`+)/).map((part, i) => {
+            if (i % 2) return part;
+            for (const t of part.matchAll(/<\/?([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^>]*)?\/?>/g)) {
+                const tag = t[1].toLowerCase();
+                ctx.diag.html.otherTags[tag] = (ctx.diag.html.otherTags[tag] || 0) + 1;
+            }
+            return part.replace(/(!?)\[([^\]]*)\]\(([^)\s]*)(?:\s+"[^"]*")?\)/g, (all, bang, text, target) => this._notionRewriteLink(ctx, rec, all, !!bang, text, target));
+        }).join('');
+    }
+
+    _notionRewriteLink(ctx, rec, all, isImage, text, target) {
+        const { plan, diag } = ctx;
+        const t = target.replace(/^<|>$/g, '');
+        if (/^data:/i.test(t)) { diag.assets.dataUrisDropped++; return ''; }
+        if (/^[a-z][a-z0-9+.-]*:/i.test(t)) {
+            if (isImage || !this._notionIsNotionUrl(t)) return all;
+            const id = this._notionIdFromUrl(t);
+            if (id && ctx.idIndex.has(id)) {
+                diag.bodyLinks.resolved++;
+                return this.planBodyLink(plan, rec.key, { ref: id, kind: 'notion_id' }, { label: text || undefined, raw: all });
+            }
+            if (id) diag.bodyLinks.outsideExport.push({ from: rec.title, id });
+            return all;
+        }
+        const resolved = this._notionResolvePath(rec.dir, t);
+        const file = ctx.files.get(resolved) || ctx.filesLower.get(resolved.toLowerCase());
+        if (/\.md$/i.test(resolved)) {
+            const id = LinkIndex.extractNotionId(resolved.split('/').pop());
+            if (id && ctx.idIndex.has(id)) {
+                diag.bodyLinks.resolved++;
+                return this.planBodyLink(plan, rec.key, { ref: id, kind: 'notion_id' }, { label: text || undefined, raw: all });
+            }
+            diag.bodyLinks.unresolved.push({ from: rec.title, target: resolved });
+            return all;
+        }
+        if (/\.csv$/i.test(resolved)) return all;
+        if (!file) { diag.assets.missing.push({ from: rec.title, path: resolved }); return all; }
+        diag.assets.planned++;
+        return this.planAsset(plan, rec.key, {
+            sourcePath: file.path, name: file.path.split('/').pop(), raw: all,
+            readBytes: async () => (await file.getFile()).arrayBuffer()
+        });
+    }
+
+    // ---- plan ----------------------------------------------------------------
+
+    _notionBuildPlan({ files, texts }, options = {}) {
+        const plan = this.createImportPlan('notion');
+        const diag = plan.parseReport = {
+            databases: [],
+            standalonePages: 0,
+            relations: { columns: [], unresolved: [] },
+            linkByTitleCandidates: [],
+            bodyLinks: { resolved: 0, outsideExport: [], unresolved: [] },
+            assets: { planned: 0, missing: [], dataUrisDropped: 0 },
+            html: { asides: 0, otherTags: {} },
+            warnings: []
+        };
+        const ctx = {
+            plan, diag, files, cfg: this._notionSettings(),
+            filesLower: new Map(Array.from(files.entries()).map(([p, f]) => [p.toLowerCase(), f])),
+            idIndex: new Map(),       // notion page id -> { key, collection }
+            titleSets: new Map(),     // collection key -> Set(exact row titles)
+            linkByTitle: new Set((options.linkByTitle || []).map(s => String(s).toLowerCase()))
+        };
+
+        const pages = new Map();
+        for (const [p, text] of texts) if (/\.md$/i.test(p)) pages.set(p, this._notionReadPage(p, text));
+        const dbs = ctx.dbs = this._notionDiscoverDatabases(texts, diag);
+
+        // pages belong to the database whose rows folder directly contains them
+        const claimed = new Set();
+        const slug = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+        for (const db of dbs) {
+            const headerSet = new Set(db.headers);
+            if (!Array.from(pages.values()).some(p => p.dir === db.rowsDir)) {
+                // Notion sanitises characters in folder names differently from the csv's: fall back to a sibling folder that reads the same
+                const alt = Array.from(new Set(Array.from(pages.values()).map(p => p.dir)))
+                    .find(d => d.split('/').slice(0, -1).join('/') === db.dir && slug(d.split('/').pop()) === slug(db.name));
+                if (alt) db.rowsDir = alt;
+            }
+            for (const page of pages.values()) {
+                if (page.dir !== db.rowsDir) continue;
+                Object.assign(page, this._notionSplitPropertyBlock(page, headerSet));
+                db.pages.push(page);
+                claimed.add(page.path);
+            }
+            this._notionMatchRows(db);
+        }
+        const standalone = Array.from(pages.values()).filter(p => !claimed.has(p.path));
+
+        // records (keys + ids first, so relations and links can resolve forward)
+        const rowCounter = { n: 0 };
+        for (const db of dbs) {
+            db.diag = {
+                name: db.collectionName, collection: db.key,
+                csv: { plain: db.info.plainCsv, all: db.info.allCsv, rowsPlain: db.info.rowsPlain, rowsAll: db.info.rowsAll,
+                    columnsOnlyInAll: db.info.headersOnlyInAll, columnsOnlyInPlain: db.info.headersOnlyInPlain, rowsOnlyInPlain: db.info.rowsOnlyInPlain || 0 },
+                rows: db.rows.length, pages: db.pages.length, matched: 0,
+                rowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
+                dateRangesTruncated: 0, columns: []
+            };
+            diag.databases.push(db.diag);
+            for (const row of db.rows) {
+                const page = row.page;
+                const title = row.title || (page && (page.h1 || page.fileTitle)) || 'Untitled';
+                const rec = {
+                    key: page && page.id ? `notion:${page.id}` : `notion:${db.id || db.name}:row:${++rowCounter.n}`,
+                    collection: db.key, title,
+                    sourcePath: page ? page.path : `${db.rowsDir}/${title}`,   // a row with no page: stable and id-free (the csv's id would alias the database)
+                    row, page, dir: page ? page.dir : db.rowsDir
+                };
+                if (page) db.diag.matched++; else db.diag.rowsWithoutPage.push(title);
+                db.records.push(rec);
+            }
+            for (const page of db.orphans) {
+                db.diag.pagesWithoutRow.push({ path: page.path, title: page.h1 || page.fileTitle });
+                db.records.push({
+                    key: page.id ? `notion:${page.id}` : `notion:path:${page.path}`, collection: db.key,
+                    title: page.h1 || page.fileTitle || 'Untitled', sourcePath: page.path, row: null, page, dir: page.dir, orphan: true
+                });
+            }
+            ctx.titleSets.set(db.key, new Set(db.records.map(r => r.title)));
+            for (const rec of db.records) if (rec.page && rec.page.id) ctx.idIndex.set(rec.page.id, { key: rec.key, collection: db.key });
+        }
+        const pageRecords = standalone.map(page => ({
+            key: page.id ? `notion:${page.id}` : `notion:path:${page.path}`, collection: 'notion-pages',
+            title: page.h1 || page.fileTitle || 'Untitled', sourcePath: page.path, row: null, page, dir: page.dir, standalone: true
+        }));
+        for (const rec of pageRecords) if (rec.page.id) ctx.idIndex.set(rec.page.id, { key: rec.key, collection: 'notion-pages' });
+        diag.standalonePages = pageRecords.length;
+
+        // collections, fields and record values
+        const usedNames = new Set(dbs.map(d => d.collectionName.toLowerCase()));
+        for (const db of dbs) {
+            const columns = this._notionAnalyzeColumns(db, ctx);
+            const usedIds = new Set(['source_path']);
+            const fieldId = (label) => {
+                let id = this.slugify(label) || 'field';
+                for (let n = 2; usedIds.has(id); n++) id = `${this.slugify(label) || 'field'}_${n}`;
+                usedIds.add(id);
+                return id;
+            };
+            const fields = [];
+            for (const col of columns) {
+                col.id = fieldId(col.header);
+                fields.push(omitUndefined({ id: col.id, label: col.header, type: col.type, many: col.many ? true : undefined, target: col.target }));
+                db.diag.columns.push(omitUndefined({ header: col.header, type: col.type, many: col.many || undefined, target: col.target, values: col.values }));
+            }
+            const companions = new Map();   // relation column header -> text field id (created on demand)
+            const companionFor = (col) => {
+                if (!companions.has(col.header)) {
+                    const id = fieldId(`${col.header} (text)`);
+                    companions.set(col.header, id);
+                    fields.splice(fields.findIndex(f => f.id === col.id) + 1, 0, { id, label: `${col.header} (text)`, type: 'text' });
+                }
+                return companions.get(col.header);
+            };
+
+            for (const rec of db.records) {
+                rec.values = {};
+                if (!rec.row) continue;
+                for (const col of columns) {
+                    const cell = rec.row.cells[col.header] || '';
+                    if (!cell) continue;
+                    if (col.type === 'record') {
+                        const { ids, text } = this._notionParseRelationCell(cell);
+                        const leftover = [];
+                        const matchedIds = [];
+                        for (const x of ids) {
+                            if (ctx.idIndex.has(x.id)) {
+                                this.planPropertyLink(plan, rec.key, col.id, { ref: x.id, kind: 'notion_id' }, { label: x.label, raw: x.url });
+                                matchedIds.push(x.id);
+                            } else {
+                                leftover.push(x.url);
+                                diag.relations.unresolved.push({ collection: db.collectionName, record: rec.title, column: col.header, id: x.id });
+                            }
+                        }
+                        col.resolved = (col.resolved || 0) + matchedIds.length;
+                        for (const t of text) {
+                            const hits = col.byTitle ? this._notionTitleHits(ctx, col.target, t) : [];
+                            if (hits.length === 1) {
+                                this.planPropertyLink(plan, rec.key, col.id, { ref: hits[0], kind: 'key' }, { raw: t });
+                                col.resolved++;
+                            } else {
+                                leftover.push(t);
+                            }
+                        }
+                        if (leftover.length) {
+                            rec.values[companionFor(col)] = leftover.join(', ');
+                            col.leftover = (col.leftover || 0) + 1;
+                            const leftText = text.filter(t => leftover.includes(t));
+                            if (leftText.length) col.leftoverCells = (col.leftoverCells || []).concat(leftText.join(', '));
+                        }
+                    } else if (col.type === 'datetime') {
+                        rec.values[col.id] = this._notionDateCell(cell).value;
+                    } else if (col.type === 'number') {
+                        rec.values[col.id] = this.coerceNumber(cell);
+                    } else if (col.type === 'choice') {
+                        const tokens = Array.from(new Set(this._notionSelectTokens(cell)));
+                        rec.values[col.id] = col.many ? tokens : tokens[0];
+                    } else {
+                        rec.values[col.id] = cell;
+                    }
+                }
+            }
+
+            // report: relation columns and link-by-title candidates
+            for (const col of columns) {
+                if (col.type === 'record') {
+                    diag.relations.columns.push(omitUndefined({
+                        collection: db.collectionName, column: col.header, target: col.target, many: col.many || undefined,
+                        cells: col.values, idShare: col.idShare, resolved: col.resolved || 0, textLeftOver: col.leftover || 0, linkedByTitle: col.byTitle || undefined
+                    }));
+                }
+                if ((col.type === 'text' || col.type === 'choice') && !col.byTitle) {
+                    const cells = db.rows.map(r => r.cells[col.header] || '');
+                    for (const c of this._notionTitleCandidates(db, col.header, cells, ctx)) {
+                        diag.linkByTitleCandidates.push({ collection: db.collectionName, column: col.header, ...c });
+                    }
+                }
+                if (col.type === 'record' && col.leftoverCells && !col.byTitle) {
+                    for (const c of this._notionTitleCandidates(db, col.header, col.leftoverCells, ctx, col.target)) {
+                        diag.linkByTitleCandidates.push({ collection: db.collectionName, column: col.header, ...c, ofLeftOverText: true });
+                    }
+                }
+            }
+            plan.collections.push({
+                key: db.key, name: db.collectionName, icon: this._notionIconFor(db.name),
+                description: 'Imported from a Notion export', fields
+            });
+        }
+        if (pageRecords.length) {
+            let name = ctx.cfg.pagesCollectionName;
+            while (usedNames.has(name.toLowerCase())) name += ' (pages)';
+            plan.collections.push({ key: 'notion-pages', name, icon: 'ti-file-text', description: 'Standalone pages from a Notion export', fields: [] });
+        }
+
+        // bodies (property blocks are dropped: the CSV is the source of truth)
+        const all = [...dbs.flatMap(d => d.records), ...pageRecords];
+        for (const rec of all) {
+            let lines = [];
+            if (rec.page) lines = rec.orphan || rec.standalone ? rec.page.lines.slice(rec.page.bodyStart) : rec.page.bodyLines;
+            rec.body = this._notionConvertBody(ctx, rec, lines);
+            const aliases = rec.page && rec.page.id ? [{ kind: 'notion_id', value: rec.page.id }] : [];
+            plan.records.push(omitUndefined({ key: rec.key, collection: rec.collection, title: rec.title, sourcePath: rec.sourcePath, aliases: aliases.length ? aliases : undefined, values: rec.values || {}, body: rec.body }));
+        }
+        return plan;
+    }
+
+    _notionTitleHits(ctx, collectionKey, title) {
+        const db = ctx.dbs.find(d => d.key === collectionKey);
+        return db ? db.records.filter(r => r.title === title).map(r => r.key) : [];
+    }
+
+    // ---- UI + report ---------------------------------------------------------
+
+    /**
+     * Turns the parse diagnostics and the applyImportPlan() report into what the dialog shows:
+     * { headline, counts: [string], sections: [{ title, tone: 'info'|'warning'|'error', items: [string] }] }.
+     * Pure; no DOM.
+     */
+    _notionSummarize(plan, report, { maxItems = 12 } = {}) {
+        const pr = plan.parseReport || {};
+        const c = (report && report.counts) || {};
+        const sections = [];
+        const section = (title, tone, all) => {
+            if (!all.length) return;
+            const items = all.slice(0, maxItems);
+            if (all.length > maxItems) items.push(`…and ${all.length - maxItems} more`);
+            sections.push({ title: `${title} (${all.length})`, tone, items });
+        };
+        const pct = (x) => `${Math.round(x * 100)}%`;
+        const dbs = pr.databases || [];
+
+        const counts = [
+            `Collections: ${c.collectionsCreated || 0} created, ${c.collectionsUpdated || 0} updated`,
+            `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
+            `Links: ${c.linksResolved || 0} resolved, ${c.linksUnresolved || 0} unresolved`,
+            `Images/files: ${c.assetsUploaded || 0} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`
+        ];
+
+        const unresolved = (report && report.unresolvedLinks) || [];
+        section('Unresolved links (left as text)', 'warning', unresolved.map(u => `${u.fromTitle || u.from}: ${u.where === 'property' ? `${u.field} → ` : ''}${u.ref} (${u.reason})`));
+        section('Relations to pages outside this export (kept as text in the "(text)" column)', 'warning',
+            (pr.relations ? pr.relations.unresolved : []).map(u => `${u.collection} / ${u.record} / ${u.column}`));
+        section('Body links to pages outside this export', 'warning',
+            [...((pr.bodyLinks && pr.bodyLinks.outsideExport) || []).map(x => `${x.from}: ${x.id}`), ...((pr.bodyLinks && pr.bodyLinks.unresolved) || []).map(x => `${x.from}: ${x.target}`)]);
+        section('Columns that name rows of another database by title (left as text)', 'info',
+            (pr.linkByTitleCandidates || []).map(x => `${x.collection}.${x.column} → ${x.targetName}: ${x.matched} of ${x.total} values (${pct(x.share)})${x.ofLeftOverText ? ' of the text cells' : ''}`));
+        section('Rows without a page', 'info', dbs.flatMap(d => d.rowsWithoutPage.map(t => `${d.name}: ${t}`)));
+        section('Pages without a CSV row (imported as records)', 'info', dbs.flatMap(d => d.pagesWithoutRow.map(p => `${d.name}: ${p.title}`)));
+        section('Empty columns (not imported)', 'info', dbs.flatMap(d => d.emptyColumns.map(h => `${d.name}.${h}`)));
+        section('Missing images/files (left as text)', 'warning', ((pr.assets && pr.assets.missing) || []).map(x => `${x.from}: ${x.path}`));
+        const notes = [];
+        if (pr.html && pr.html.asides) notes.push(`${pr.html.asides} <aside> callouts converted to blockquotes`);
+        for (const [tag, n] of Object.entries((pr.html && pr.html.otherTags) || {})) notes.push(`<${tag}> appears ${n}× and is imported as-is`);
+        if (pr.assets && pr.assets.dataUrisDropped) notes.push(`${pr.assets.dataUrisDropped} inline data: images dropped`);
+        const ranges = dbs.reduce((n, d) => n + d.dateRangesTruncated, 0);
+        if (ranges) notes.push(`${ranges} date ranges imported as their start date`);
+        section('Notes', 'info', [...notes, ...(pr.warnings || [])]);
+        section('Errors', 'error', ((report && report.errors) || []).map(e => `pass ${e.pass}${e.record ? ` / ${e.record}` : ''}: ${e.message}`));
+        section('Warnings', 'warning', ((report && report.warnings) || []).map(w => w.message || String(w)));
+
+        const failed = (c.recordsFailed || 0) + ((report && report.errors) || []).length;
+        return {
+            headline: `${plan.collections.length} collection(s), ${plan.records.length} record(s)${failed ? `, ${failed} problem(s)` : ''}`,
+            counts, sections
+        };
+    }
+
+    _notionReportHtml(summary, colors) {
+        const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const tone = { info: colors.info, warning: colors.warning, error: colors.error };
+        return `
+            <div style="font-size: 13px; color: ${colors.text};">
+                <div style="margin-bottom: 8px;">${summary.counts.map(esc).join('<br>')}</div>
+                ${summary.sections.map(s => `
+                    <details ${s.tone === 'error' ? 'open' : ''} style="margin-top: 6px;">
+                        <summary style="cursor: pointer; color: ${tone[s.tone] || colors.text};">${esc(s.title)}</summary>
+                        <ul style="margin: 4px 0 0 0; padding-left: 20px; color: ${colors.textSecondary}; word-break: break-word;">
+                            ${s.items.map(i => `<li>${esc(i)}</li>`).join('')}
+                        </ul>
+                    </details>`).join('')}
+            </div>`;
+    }
+
+    async performNotionImport(dialog, overlay, dirHandle) {
+        const statusDiv = dialog.querySelector('#md-status');
+        const importBtn = dialog.querySelector('#md-import-btn');
+        const cancelBtn = dialog.querySelector('#md-cancel-btn');
+        let reportDiv = dialog.querySelector('#md-notion-report');
+        if (!reportDiv) {
+            reportDiv = document.createElement('div');
+            reportDiv.id = 'md-notion-report';
+            reportDiv.style.marginTop = '12px';
+            statusDiv.insertAdjacentElement('afterend', reportDiv);
+        }
+        reportDiv.innerHTML = '';
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing...';
+        try {
+            this.showStatus(statusDiv, 'Reading Notion export...', 'info');
+            const plan = await this.parseNotionExport(dirHandle);
+            if (plan.records.length === 0) {
+                throw new Error('No Notion database rows or pages found in that folder');
+            }
+            const report = await this.applyImportPlan(plan, {
+                onProgress: ({ message, done, total }) => this.showStatus(statusDiv, total ? `${message} (${done}/${total})` : message, 'info')
+            });
+            const summary = this._notionSummarize(plan, report);
+            this.showStatus(statusDiv, `${report.errors.length ? 'Finished with problems' : 'Complete!'} ${summary.headline}`, report.errors.length ? 'warning' : 'success');
+            reportDiv.innerHTML = this._notionReportHtml(summary, this.getThemeColors());
+            cancelBtn.textContent = 'Close';
+        } catch (error) {
+            console.error('[Notion Import] Error:', error);
+            this.showStatus(statusDiv, `Error: ${error.message}`, 'error');
+        }
+        importBtn.disabled = false;
+        importBtn.textContent = 'Import';
     }
 
     // =========================================================================
