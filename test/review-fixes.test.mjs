@@ -211,3 +211,80 @@ test('finding 5 (Notion): column ids were already collision-free, including the 
     const drill = plan.records[0];
     assert.deepEqual(drill.values, { cost: 10, cost_2: 5, cost_3: 'high' });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Findings 3, 4 and 6: the engine on re-import
+// ---------------------------------------------------------------------------------------------
+
+function engine() {
+    const thymer = new FakeThymer();
+    const p = newPlugin({ DateTime: FakeDateTime });
+    p.data = thymer.data;
+    return { thymer, p };
+}
+
+/** A one-collection plan. fields: [{ id, label, type, many? }]; records: [{ key, title, sourcePath, values }]. */
+function simplePlan(p, { fields, records, name = 'Things' }) {
+    const plan = p.createImportPlan('synthetic');
+    plan.collections.push({ key: 'things', name, icon: 'ti-box', description: 'Synthetic', fields });
+    for (const r of records) plan.records.push({ collection: 'things', body: '', values: {}, ...r });
+    return plan;
+}
+const choiceLabels = (thymer, name, fieldId) => thymer.collection(name).config.fields.find(f => f.id === fieldId).choices.map(c => c.label);
+
+// ---- Finding 4 --------------------------------------------------------------------------------
+
+test('finding 4: a persisted choice field gets new options even when the fresh inference is text', async () => {
+    const { thymer, p } = engine();
+    const first = simplePlan(p, {
+        fields: [{ id: 'status', label: 'Status', type: 'choice' }],
+        records: [{ key: 'a', title: 'A', sourcePath: 'a.md', values: { status: 'open' } }]
+    });
+    await p.applyImportPlan(first, fast);
+    assert.deepEqual(choiceLabels(thymer, 'Things', 'status'), ['open']);
+
+    // the next export has more values, and the column is now inferred as text
+    const second = simplePlan(p, {
+        fields: [{ id: 'status', label: 'Status', type: 'text' }],
+        records: [
+            { key: 'a', title: 'A', sourcePath: 'a.md', values: { status: 'archived' } },
+            { key: 'b', title: 'B', sourcePath: 'b.md', values: { status: 'Open' } }
+        ]
+    });
+    const report = await p.applyImportPlan(second, fast);
+    assert.deepEqual(report.warnings.filter(w => w.code === 'property-not-set'), [], 'no value dropped');
+    assert.equal(thymer.collection('Things').config.fields.find(f => f.id === 'status').type, 'choice', 'never retyped');
+    assert.deepEqual(choiceLabels(thymer, 'Things', 'status'), ['open', 'archived'], 'new option added; "Open" matches "open" case-insensitively');
+    assert.equal(thymer.recordByTitle('Things', 'A').prop('status').choiceLabel(), 'archived');
+    assert.equal(thymer.recordByTitle('Things', 'B').prop('status').choiceLabel(), 'open');
+});
+
+test('finding 4: the same for a multi-value choice field', async () => {
+    const { thymer, p } = engine();
+    await p.applyImportPlan(simplePlan(p, {
+        fields: [{ id: 'tags', label: 'Tags', type: 'choice', many: true }],
+        records: [{ key: 'a', title: 'A', sourcePath: 'a.md', values: { tags: ['x', 'y'] } }]
+    }), fast);
+    const report = await p.applyImportPlan(simplePlan(p, {
+        fields: [{ id: 'tags', label: 'Tags', type: 'text', many: true }],
+        records: [{ key: 'a', title: 'A', sourcePath: 'a.md', values: { tags: ['y', 'z'] } }]
+    }), fast);
+    assert.deepEqual(report.warnings.filter(w => w.code === 'property-not-set'), []);
+    assert.deepEqual(choiceLabels(thymer, 'Things', 'tags'), ['x', 'y', 'z']);
+    assert.deepEqual(thymer.recordByTitle('Things', 'A').prop('tags').selectedChoiceLabels(), ['y', 'z']);
+});
+
+test('finding 4: a persisted text field is left alone when the fresh inference says choice', async () => {
+    const { thymer, p } = engine();
+    await p.applyImportPlan(simplePlan(p, {
+        fields: [{ id: 'status', label: 'Status', type: 'text' }],
+        records: [{ key: 'a', title: 'A', sourcePath: 'a.md', values: { status: 'open' } }]
+    }), fast);
+    await p.applyImportPlan(simplePlan(p, {
+        fields: [{ id: 'status', label: 'Status', type: 'choice' }],
+        records: [{ key: 'a', title: 'A', sourcePath: 'a.md', values: { status: 'closed' } }]
+    }), fast);
+    const field = thymer.collection('Things').config.fields.find(f => f.id === 'status');
+    assert.equal(field.type, 'text');
+    assert.equal(thymer.recordByTitle('Things', 'A').text('status'), 'closed');
+});

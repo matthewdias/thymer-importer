@@ -5808,11 +5808,15 @@ class Plugin extends AppPlugin {
                 if (Array.isArray(config.page_field_ids)) config.page_field_ids.push(w.id);
                 continue;
             }
-            if (have.type === 'choice' && w.type === 'choice') {
+            if (have.type === 'choice') {
+                // Decided by the persisted field, not by this run's inference: a column that was a choice on the first
+                // import can come back as text (e.g. more distinct values), and its values must still find an option.
+                // The field is never retyped; only missing options are added.
+                const labels = w.type === 'choice' ? w.choices.map(c => c.label) : this._planChoiceLabels(ctx, def, w.id, []);
                 have.choices = have.choices || [];
                 const known = new Set(have.choices.map(c => String(c.label).toLowerCase()));
                 const used = new Set(have.choices.map(c => c.id));
-                const fresh = w.choices.filter(c => !known.has(c.label.toLowerCase())).map(c => c.label);
+                const fresh = labels.filter(label => !known.has(label.toLowerCase()));
                 have.choices.push(...this._planChoiceOptions(fresh, [], have.choices.length, used));
             }
             if (have.type === 'record' && !have.filter_colguid && w.filter_colguid) {
