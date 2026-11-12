@@ -288,3 +288,69 @@ test('finding 4: a persisted text field is left alone when the fresh inference s
     assert.equal(field.type, 'text');
     assert.equal(thymer.recordByTitle('Things', 'A').text('status'), 'closed');
 });
+
+// ---- Finding 3 --------------------------------------------------------------------------------
+
+const thingRecords = async (thymer) => (await thymer.collection('Things').getAllRecords());
+
+test('finding 3: a changed title with the same source_path updates the record instead of duplicating it', async () => {
+    const { thymer, p } = engine();
+    const fields = [{ id: 'note', label: 'Note', type: 'text' }];
+    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md', values: { note: 'one' }, body: 'First body' }] }), fast);
+    const [original] = await thingRecords(thymer);
+
+    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New Title', sourcePath: 'notes/a.md', values: { note: 'two' }, body: 'Second body' }] }), fast);
+    const all = await thingRecords(thymer);
+    assert.equal(all.length, 1, 'no duplicate');
+    assert.equal(all[0].guid, original.guid);
+    assert.equal(report.counts.recordsCreated, 0);
+    assert.equal(report.counts.recordsUpdated, 1);
+    assert.equal(all[0].text('note'), 'two', 'the update was applied');
+    assert.equal((await all[0].getLineItems(false)).map(i => i.text).join('|'), 'Second body');
+});
+
+test('finding 3: the title change is reported (the SDK has no record rename: PluginRecord only has getName(), types.d.ts:3305)', async () => {
+    const { thymer, p } = engine();
+    const fields = [];
+    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md' }] }), fast);
+    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New Title', sourcePath: 'notes/a.md' }] }), fast);
+    const warning = report.warnings.find(w => w.code === 'title-changed');
+    assert.ok(warning, JSON.stringify(report.warnings));
+    assert.equal(warning.record, 'a');
+    assert.match(warning.message, /Old Title/);
+    assert.match(warning.message, /New Title/);
+    assert.equal((await thingRecords(thymer))[0].getName(), 'Old Title', 'left as is');
+    // an unchanged title is not reported
+    const again = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md' }] }), fast);
+    assert.equal(again.warnings.filter(w => w.code === 'title-changed').length, 0);
+});
+
+test('finding 3: paths are matched trimmed and case-folded', async () => {
+    const { thymer, p } = engine();
+    await p.applyImportPlan(simplePlan(p, { fields: [], records: [{ key: 'a', title: 'A', sourcePath: 'Notes/A.md' }] }), fast);
+    const report = await p.applyImportPlan(simplePlan(p, { fields: [], records: [{ key: 'a', title: 'A', sourcePath: ' notes/a.md ' }] }), fast);
+    assert.equal(report.counts.recordsCreated, 0);
+    assert.equal((await thingRecords(thymer)).length, 1);
+});
+
+test('finding 3: a record with no source_path is still adopted by title, once; a path-backed record is never taken by title', async () => {
+    const { thymer, p } = engine();
+    const fields = [];
+    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'x', title: 'Same', sourcePath: 'x.md' }] }), fast);
+    const things = thymer.collection('Things');
+    const manualGuid = things.createRecord('Manual');   // made by hand: no source_path
+    const manual = thymer.records.get(manualGuid);
+
+    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [
+        { key: 'm', title: 'Manual', sourcePath: 'm.md' },
+        { key: 'y', title: 'Same', sourcePath: 'y.md' }      // same title as x.md, different file: its own record
+    ] }), fast);
+    assert.equal(report.counts.recordsCreated, 1, 'only "Same" (y.md) is new');
+    assert.equal(manual.text('source_path'), 'm.md', 'adopted: source_path now set');
+    assert.equal((await thingRecords(thymer)).length, 3);
+
+    // and the adopted record is now matched by path, even if its title changes later
+    const third = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'm', title: 'Manual renamed', sourcePath: 'm.md' }] }), fast);
+    assert.equal(third.counts.recordsCreated, 0);
+    assert.equal((await thingRecords(thymer)).length, 3);
+});

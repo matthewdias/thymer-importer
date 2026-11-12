@@ -5841,15 +5841,23 @@ class Plugin extends AppPlugin {
         throw new Error(`record ${guid} not found after creation`);
     }
 
-    /** Same dedupe keys as executeImport(): source_path||title, plus title-only for records that have no path. */
+    /**
+     * Existing records of a collection, indexed for re-import:
+     *   byPath  source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
+     *   byTitle title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
+     * A record that has a source_path is identified by it alone, so a changed title cannot create a duplicate.
+     * executeImport() (CSV / Obsidian / ...) keeps its own source_path||title key; only the engine uses this.
+     */
     async _planExistingRecords(collection) {
-        const byKey = new Map();
+        const norm = (text) => String(text || '').trim().toLowerCase();
+        const byPath = new Map();
+        const byTitle = new Map();
         for (const record of await collection.getAllRecords()) {
-            const pathValue = typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '';
-            const key = this.makeDedupKey(pathValue, record.getName());
-            if (key.trim() !== '||') byKey.set(key, record);
+            const pathValue = norm(typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '');
+            if (pathValue) byPath.set(pathValue, record);
+            else if (norm(record.getName())) byTitle.set(norm(record.getName()), record);
         }
-        return byKey;
+        return { byPath, byTitle, norm };
     }
 
     /** Deletes a record's body (children first). Never follows references into other records. */
@@ -5883,15 +5891,15 @@ class Plugin extends AppPlugin {
                 if (!existingByCollection.has(def.collection)) {
                     existingByCollection.set(def.collection, await this._planExistingRecords(col.api));
                 }
-                const existingByKey = existingByCollection.get(def.collection);
-                const pathKey = this.makeDedupKey(def.sourcePath, def.title);
-                let found = existingByKey.get(pathKey);
-                if (!found) {
+                const existing = existingByCollection.get(def.collection);
+                const pathKey = existing.norm(def.sourcePath);
+                const titleKey = existing.norm(def.title);
+                let found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                if (!found && pathKey) {
                     // Adopt a record that has the same title but no source_path yet, once only
-                    // (executeImport() keeps the fallback key, so same-titled files overwrite each other).
-                    const fallbackKey = this.makeDedupKey('', def.title);
-                    found = existingByKey.get(fallbackKey);
-                    if (found) existingByKey.delete(fallbackKey);
+                    // (a record that has a source_path is never taken by title).
+                    found = existing.byTitle.get(titleKey);
+                    if (found) existing.byTitle.delete(titleKey);
                 }
                 let record = found;
                 const isUpdate = !!found;
@@ -5910,8 +5918,17 @@ class Plugin extends AppPlugin {
                     await this._planSleep(ctx, ctx.opts.settleMs ?? 300);
                 }
                 ctx.index.bind(def.key, record.guid);
-                existingByKey.set(pathKey, record);
+                if (pathKey) existing.byPath.set(pathKey, record);
+                else existing.byTitle.set(titleKey, record);
                 ctx.records.set(def.key, { def, record });
+                if (isUpdate && String(record.getName()).trim() !== String(def.title || '').trim()) {
+                    // The SDK has no way to rename a record (PluginRecord has getName() only, types.d.ts:3305), so the
+                    // record keeps its old title; matching by source_path means it is still updated, not duplicated.
+                    ctx.report.warnings.push({
+                        code: 'title-changed', record: def.key,
+                        message: `"${record.getName()}" is now titled "${def.title}" in the source; the existing record was updated but could not be renamed`
+                    });
+                }
 
                 if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
                     ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
