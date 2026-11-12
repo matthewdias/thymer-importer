@@ -4,6 +4,7 @@ const VERSION = 'v0.0.13';
  * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
  * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
+ * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title is a warning, not a duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
