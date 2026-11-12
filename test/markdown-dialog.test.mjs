@@ -73,3 +73,31 @@ test('Markdown dialog: Tolaria and Notion hide the collection and journal picker
         delete globalThis.document;
     }
 });
+
+test('Markdown dialog: Tolaria/Notion use the input folder picker, never showDirectoryPicker', async () => {
+    const doc = fakeDocument();
+    globalThis.document = doc;
+    globalThis.window = { showDirectoryPicker: () => { throw new Error('showDirectoryPicker must not be called'); } };
+    try {
+        const p = newPlugin();
+        p.getThemeColors = () => new Proxy({}, { get: () => '#000' });
+        p.loadCollections = () => {};
+        let inputPicks = 0;
+        p.pickFolderViaInput = async () => { inputPicks++; return { kind: 'filelist', files: [{ name: 'a.md', webkitRelativePath: 'Vault/a.md' }] }; };
+        p.showMarkdownImportDialog();
+
+        const source = doc.byId.get('md-source-select');
+        const button = doc.byId.get('select-folder-btn');
+        const info = doc.byId.get('folder-info');
+        for (const v of ['tolaria', 'notion']) {
+            source.value = v; source.fire('change');
+            info.textContent = '';
+            await button.onclick();
+            assert.match(info.textContent, /Folder selected \(1 file/);
+        }
+        assert.equal(inputPicks, 2);
+    } finally {
+        delete globalThis.document;
+        delete globalThis.window;
+    }
+});

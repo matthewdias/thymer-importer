@@ -444,29 +444,42 @@ class Plugin extends AppPlugin {
                 }
             }
 
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.webkitdirectory = true;
-            input.multiple = true;
-            input.style.display = 'none';
-            document.body.appendChild(input);
-
-            return await new Promise((resolve) => {
-                input.addEventListener('change', () => {
-                    const files = Array.from(input.files || []);
-                    document.body.removeChild(input);
-                    if (files.length === 0) {
-                        resolve(null);
-                    } else {
-                        resolve({ kind: 'filelist', files });
-                    }
-                }, { once: true });
-                input.click();
-            });
+            return await this.pickFolderViaInput();
         } catch (error) {
             if (error.name === 'AbortError') return null;
             throw error;
         }
+    }
+
+    /**
+     * Folder picker using <input webkitdirectory>, resolving to { kind: 'filelist', files } or null.
+     * Used directly by the Tolaria and Notion sources: in Thymer Desktop, showDirectoryPicker()
+     * throws AbortError even after the user picks a folder, which pickFolder() treats as a cancel,
+     * while the input picker works there (and in Chrome, Edge and Safari).
+     */
+    pickFolderViaInput() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.webkitdirectory = true;
+        input.multiple = true;
+        input.style.display = 'none';
+        document.body.appendChild(input);
+
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                if (input.parentNode) input.parentNode.removeChild(input);
+                resolve(value);
+            };
+            input.addEventListener('change', () => {
+                const files = Array.from(input.files || []);
+                finish(files.length === 0 ? null : { kind: 'filelist', files });
+            }, { once: true });
+            input.addEventListener('cancel', () => finish(null), { once: true });
+            input.click();
+        });
     }
 
     async scanObsidianDailyNotes(dirHandle) {
@@ -2139,8 +2152,15 @@ class Plugin extends AppPlugin {
 
         dialog.querySelector('#select-folder-btn').onclick = async () => {
             try {
-                const picked = await this.pickFolder();
+                // Tolaria and Notion only need the file list, and the input picker is the one that
+                // works in Thymer Desktop (see pickFolderViaInput).
+                const picked = plansOwnCollections() ? await this.pickFolderViaInput() : await this.pickFolder();
                 if (!picked) {
+                    if (plansOwnCollections()) {
+                        const folderInfo = dialog.querySelector('#folder-info');
+                        folderInfo.textContent = 'No folder selected (or the folder was empty).';
+                        folderInfo.style.color = colors.textSecondary;
+                    }
                     return;
                 }
                 selectedDirHandle = picked;
