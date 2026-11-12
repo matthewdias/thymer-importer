@@ -4332,9 +4332,16 @@ class Plugin extends AppPlugin {
         this.showStatus(statusDiv, 'Reading Tolaria vault...', 'info');
         const probe = this._tolariaIconProbe();
         try {
-            const plan = await this.parseTolariaVault(dirHandle, { iconExists: probe.exists });
-            if (plan.records.length === 0) {
+            const parsed = await this.parseTolariaVault(dirHandle, { iconExists: probe.exists });
+            if (parsed.records.length === 0) {
                 this.showStatus(statusDiv, 'No Tolaria notes found in that folder (expected *.md files with frontmatter).', 'error');
+                importBtn.disabled = false;
+                importBtn.textContent = 'Import';
+                return;
+            }
+            const plan = await this._resolveNameClashes(dialog, parsed, { label: 'Tolaria', prefix: 'Tolaria · ' });
+            if (!plan) {
+                this.showStatus(statusDiv, 'Import cancelled. Nothing was changed.', 'info');
                 importBtn.disabled = false;
                 importBtn.textContent = 'Import';
                 return;
@@ -5189,9 +5196,16 @@ class Plugin extends AppPlugin {
         importBtn.textContent = 'Importing...';
         try {
             this.showStatus(statusDiv, 'Reading Notion export...', 'info');
-            const plan = await this.parseNotionExport(dirHandle);
-            if (plan.records.length === 0) {
+            const parsed = await this.parseNotionExport(dirHandle);
+            if (parsed.records.length === 0) {
                 throw new Error('No Notion database rows or pages found in that folder');
+            }
+            const plan = await this._resolveNameClashes(dialog, parsed, { label: 'Notion', prefix: 'Notion · ' });
+            if (!plan) {
+                this.showStatus(statusDiv, 'Import cancelled. Nothing was changed.', 'info');
+                importBtn.disabled = false;
+                importBtn.textContent = 'Import';
+                return;
             }
             const report = await this.applyImportPlan(plan, {
                 onProgress: ({ message, done, total }) => this.showStatus(statusDiv, total ? `${message} (${done}/${total})` : message, 'info')
@@ -5207,6 +5221,183 @@ class Plugin extends AppPlugin {
         importBtn.disabled = false;
         importBtn.textContent = 'Import';
     }
+
+    // ===== Name-clash check (Tolaria / Notion) =====
+    //
+    // applyImportPlan() finds its target collections by name, so a workspace that already has a
+    // "Notes" or "Projects" collection would silently receive the import. Before applying a plan,
+    // the Tolaria and Notion dialog flows call _resolveNameClashes(), which lets an existing
+    // same-named collection through silently only when it is a previous import from this source:
+    // it has a source_path field and one of its records has the source_path of a record the plan
+    // puts in that collection. Anything else is a clash, and the user chooses between
+    //   - separate collections: every planned collection name gets an editable prefix, and
+    //   - merging into the existing collections (what the engine does on its own).
+    // The prefix is applied to the plan before applyImportPlan() runs, so re-importing with the same
+    // prefix finds the prefixed collections by name and updates them in place.
+
+    /** Collection names are matched trimmed and case-folded, exactly as applyImportPlan() does. */
+    _collectionNameKey(name) {
+        return String(name || '').trim().toLowerCase();
+    }
+
+    /**
+     * Existing collections that share a name with a planned collection and are not a previous import
+     * of this source. Returns [{ key, name, existingName, guid, reason }] where reason is
+     * 'no-source-path-field' or 'no-matching-records' ('unreadable' if the collection could not be read).
+     * Journal collections are ignored, as in applyImportPlan().
+     */
+    async findCollectionClashes(plan) {
+        const existing = new Map();
+        for (const c of await this.data.getAllCollections()) {
+            if (typeof c.isJournalPlugin === 'function' && c.isJournalPlugin()) continue;
+            const n = this._collectionNameKey(c.getName());
+            if (n && !existing.has(n)) existing.set(n, c);   // first one wins, as in applyImportPlan()
+        }
+        const clashes = [];
+        for (const def of (plan && plan.collections) || []) {
+            const api = existing.get(this._collectionNameKey(def.name));
+            if (!api) continue;
+            const reason = await this._collectionClashReason(api, plan, def);
+            if (reason) clashes.push({ key: def.key, name: def.name, existingName: api.getName(), guid: api.getGuid(), reason });
+        }
+        return clashes;
+    }
+
+    /** null when `api` is a previous import of `def`; otherwise why it is not. */
+    async _collectionClashReason(api, plan, def) {
+        try {
+            const fields = (api.getConfiguration() || {}).fields || [];
+            if (!fields.some(f => f && f.id === 'source_path')) return 'no-source-path-field';
+            const planned = new Set();
+            for (const rec of plan.records || []) {
+                if (rec.collection === def.key && rec.sourcePath) planned.add(String(rec.sourcePath).trim().toLowerCase());
+            }
+            for (const record of await api.getAllRecords()) {
+                const path = typeof record.text === 'function' ? record.text('source_path') : null;
+                if (path && planned.has(String(path).trim().toLowerCase())) return null;
+            }
+            return 'no-matching-records';
+        } catch (error) {
+            console.warn('[Import] could not read collection', api.getName(), error);
+            return 'unreadable';   // when in doubt, ask
+        }
+    }
+
+    /** A copy of the plan with `prefix` in front of every collection name (keys, records and links are untouched). */
+    prefixImportPlan(plan, prefix) {
+        return { ...plan, collections: (plan.collections || []).map(c => ({ ...c, name: `${prefix}${c.name}` })) };
+    }
+
+    /**
+     * Returns the plan to apply: the plan itself when nothing clashes (or the user chose to merge),
+     * a prefixed copy when the user chose separate collections, or null when the user backed out.
+     * `prompt` (default: the dialog panel) is injectable for tests.
+     */
+    async _resolveNameClashes(dialog, plan, { label, prefix, prompt } = {}) {
+        let clashes = await this.findCollectionClashes(plan);
+        if (!clashes.length) return plan;
+        const ask = prompt || ((state) => this._promptNameClashes(dialog, state));
+        let current = plan;
+        let chosen = prefix;
+        for (;;) {
+            const choice = await ask({ label, plan, current, clashes, prefix: chosen });
+            if (!choice) return null;
+            if (choice.mode === 'merge') return current;
+            chosen = String(choice.prefix || '').trimStart();
+            const prefixed = this.prefixImportPlan(plan, chosen);
+            // The prefixed names can clash too (an unrelated "Tolaria · Notes"): ask again with those.
+            clashes = await this.findCollectionClashes(prefixed);
+            if (!clashes.length) return prefixed;
+            current = prefixed;
+        }
+    }
+
+    /** Clash panel in the dialog. Resolves { mode: 'separate', prefix } | { mode: 'merge' } | null (back out). */
+    _promptNameClashes(dialog, { label, plan, clashes, prefix }) {
+        const colors = this.getThemeColors();
+        const statusDiv = dialog.querySelector('#md-status');
+        const importBtn = dialog.querySelector('#md-import-btn');
+        let box = dialog.querySelector('#md-clash-container');
+        if (!box) {
+            box = document.createElement('div');
+            box.id = 'md-clash-container';
+            if (statusDiv && typeof statusDiv.insertAdjacentElement === 'function') statusDiv.insertAdjacentElement('afterend', box);
+            else dialog.appendChild(box);
+        }
+        box.innerHTML = '';
+        box.style.cssText = `margin-top: 12px; padding: 12px; border-radius: 6px; border: 1px solid ${colors.warning}; background: ${colors.backgroundSecondary}; color: ${colors.text}; font-size: 13px; text-align: left;`;
+        box.style.display = 'block';
+        this.showStatus(statusDiv, 'Some collections already exist. Choose how to import before anything is written.', 'warning');
+        if (importBtn) { importBtn.disabled = true; importBtn.textContent = 'Waiting for your choice...'; }
+
+        const add = (parent, tag, props = {}, style = '') => {
+            const el = document.createElement(tag);
+            Object.assign(el, props);
+            if (style) el.style.cssText = style;
+            parent.appendChild(el);
+            return el;
+        };
+        const reasonText = { 'no-source-path-field': 'has no Source Path field', 'no-matching-records': 'has no records from this import', unreadable: 'could not be read' };
+        const exact = (c) => (c.existingName === c.name ? `"${c.name}"` : `"${c.name}" (existing: "${c.existingName}")`);
+
+        add(box, 'div', { textContent: 'Collections that already exist' }, 'font-weight: 600; margin-bottom: 6px;');
+        add(box, 'div', {
+            textContent: `This ${label} import has collections with the same names as existing ones, and they do not look like a previous ${label} import:`
+        }, `color: ${colors.textSecondary}; margin-bottom: 4px;`);
+        const list = add(box, 'ul', {}, 'margin: 0 0 10px 0; padding-left: 20px;');
+        for (const c of clashes) add(list, 'li', { textContent: `${exact(c)}: ${reasonText[c.reason] || c.reason}` });
+
+        const labelStyle = 'display: flex; align-items: flex-start; gap: 8px; cursor: pointer; margin-top: 8px;';
+        const separateRow = add(box, 'label', {}, labelStyle);
+        const separate = add(separateRow, 'input', { type: 'radio', name: 'md-clash-mode', id: 'md-clash-separate', checked: true }, 'margin-top: 3px;');
+        const separateText = add(separateRow, 'span', {}, 'flex: 1;');
+        add(separateText, 'div', { textContent: 'Import into separate collections' }, 'font-weight: 500;');
+        add(separateText, 'div', { textContent: 'Every collection from this import gets the prefix below, so the whole source stays together. Importing again with the same prefix updates them.' }, `color: ${colors.textSecondary}; font-size: 12px;`);
+        const prefixInput = add(separateText, 'input', { type: 'text', id: 'md-clash-prefix', value: prefix }, `width: 100%; margin-top: 6px; padding: 6px 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text}; font-size: 13px;`);
+        const preview = add(separateText, 'div', { id: 'md-clash-preview' }, `margin-top: 4px; color: ${colors.textSecondary}; font-size: 12px; word-break: break-word;`);
+
+        const mergeRow = add(box, 'label', {}, labelStyle);
+        const merge = add(mergeRow, 'input', { type: 'radio', name: 'md-clash-mode', id: 'md-clash-merge', checked: false }, 'margin-top: 3px;');
+        const mergeText = add(mergeRow, 'span', {}, 'flex: 1;');
+        add(mergeText, 'div', { textContent: 'Merge into existing collections' }, 'font-weight: 500;');
+        add(mergeText, 'div', { textContent: 'Records are added to the collections above, and new fields are added to them. A record with the same title as an existing one replaces its content.' }, `color: ${colors.textSecondary}; font-size: 12px;`);
+
+        const problem = add(box, 'div', { id: 'md-clash-problem' }, `margin-top: 8px; color: ${colors.error}; font-size: 12px;`);
+        const actions = add(box, 'div', {}, 'display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px;');
+        const back = add(actions, 'button', { type: 'button', id: 'md-clash-back', textContent: 'Do not import' }, `padding: 6px 12px; border: 1px solid ${colors.buttonBorder}; background: ${colors.buttonBg}; color: ${colors.buttonText}; border-radius: 4px; cursor: pointer;`);
+        const go = add(actions, 'button', { type: 'button', id: 'md-clash-continue', textContent: 'Continue' }, `padding: 6px 12px; border: none; background: ${colors.primary}; color: #fff; border-radius: 4px; cursor: pointer;`);
+
+        const names = () => (plan.collections || []).map(c => `${String(prefixInput.value || '').trimStart()}${c.name}`);
+        const refresh = () => {
+            const shown = names();
+            preview.textContent = `Collections will be named: ${shown.slice(0, 8).join(', ')}${shown.length > 8 ? `, and ${shown.length - 8} more` : ''}`;
+            prefixInput.disabled = !separate.checked;
+            problem.textContent = '';
+        };
+        separate.onchange = merge.onchange = refresh;
+        prefixInput.oninput = refresh;
+        refresh();
+
+        return new Promise((resolve) => {
+            const finish = (result) => {
+                box.innerHTML = '';
+                box.style.display = 'none';
+                if (importBtn) { importBtn.textContent = 'Importing...'; }
+                resolve(result);
+            };
+            back.onclick = () => finish(null);
+            go.onclick = () => {
+                if (merge.checked) return finish({ mode: 'merge' });
+                if (!String(prefixInput.value || '').trim()) {
+                    problem.textContent = 'Enter a prefix, or choose to merge.';
+                    return;
+                }
+                finish({ mode: 'separate', prefix: String(prefixInput.value).trimStart() });
+            };
+        });
+    }
+
+    // ===== end Name-clash check =====
 
     // =========================================================================
     // IMPORT PLAN ENGINE
@@ -5410,14 +5601,14 @@ class Plugin extends AppPlugin {
         const byName = new Map();
         for (const c of await this.data.getAllCollections()) {
             if (typeof c.isJournalPlugin === 'function' && c.isJournalPlugin()) continue;
-            const n = String(c.getName() || '').trim().toLowerCase();
+            const n = this._collectionNameKey(c.getName());
             if (n && !byName.has(n)) byName.set(n, c);
         }
 
         // 1a: find or create a shell for every collection, so GUIDs exist before record fields reference them
         for (const def of defs) {
             try {
-                const name = String(def.name || '').trim().toLowerCase();
+                const name = this._collectionNameKey(def.name);
                 let api = byName.get(name);
                 let created = false;
                 if (!api) {
