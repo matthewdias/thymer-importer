@@ -1,5 +1,5 @@
 // Parses a real Tolaria vault and applies the plan to the fake. Skipped unless TOLARIA_VAULT is set:
-//   TOLARIA_VAULT="/path/to/Personal Vault" npm test
+//   TOLARIA_VAULT="/path/to/vault" npm test
 // It reads the vault and never writes to it or copies anything out of it; only counts are printed.
 // The expected numbers describe the maintainer's own vault as of 2026-11-10 and will need updating
 // when that vault changes.

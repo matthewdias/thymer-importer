@@ -7,20 +7,20 @@ const { LinkIndex } = loadPlugin();
 const NOTION_A = '0123456789abcdef0123456789abcdef';
 const NOTION_B = 'fedcba9876543210fedcba9876543210';
 
-test('slug alias: [[home-assistant]] resolves to home-assistant.md, case-folded', () => {
+test('slug alias: [[home-lab]] resolves to home-lab.md, case-folded', () => {
     const idx = new LinkIndex();
-    idx.addRecord({ key: 'r1', collection: 'projects', sourcePath: 'projects/home-assistant.md', title: 'Home Assistant' });
-    const hit = idx.resolve('home-assistant');
+    idx.addRecord({ key: 'r1', collection: 'projects', sourcePath: 'projects/home-lab.md', title: 'Home Lab' });
+    const hit = idx.resolve('home-lab');
     assert.equal(hit.status, 'resolved');
     assert.equal(hit.key, 'r1');
     assert.equal(hit.via, 'slug');
-    assert.equal(idx.resolve('HOME-Assistant').key, 'r1');
+    assert.equal(idx.resolve('HOME-Lab').key, 'r1');
 });
 
 test('title alias is case-folded and whitespace-collapsed', () => {
     const idx = new LinkIndex();
-    idx.addRecord({ key: 'r1', sourcePath: 'x.md', title: 'Home   Assistant' });
-    const hit = idx.resolve('  home assistant ');
+    idx.addRecord({ key: 'r1', sourcePath: 'x.md', title: 'Home   Lab' });
+    const hit = idx.resolve('  home lab ');
     assert.equal(hit.status, 'resolved');
     assert.equal(hit.via, 'title');
 });
@@ -28,7 +28,7 @@ test('title alias is case-folded and whitespace-collapsed', () => {
 test('unresolved links are reported, never thrown', () => {
     const idx = new LinkIndex();
     idx.addRecord({ key: 'r1', sourcePath: 'a.md', title: 'A' });
-    assert.deepEqual(idx.resolve('luca-rossi'), { status: 'unresolved', ref: 'luca-rossi', reason: 'not-found' });
+    assert.deepEqual(idx.resolve('no-such-person'), { status: 'unresolved', ref: 'no-such-person', reason: 'not-found' });
     assert.equal(idx.resolve('').status, 'unresolved');
     assert.equal(idx.resolve('').reason, 'empty');
     assert.equal(idx.resolve(null).status, 'unresolved');

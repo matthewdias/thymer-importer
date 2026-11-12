@@ -1,8 +1,9 @@
-const VERSION = 'v0.0.12';
+const VERSION = 'v0.0.13';
 /**
  * Unified Import Plugin for Thymer
  * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
+ * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -30,7 +31,7 @@ const VERSION = 'v0.0.12';
  *   key        exact source key
  *   path       source_path, lowercased, without .md; relative links resolve against the linking record's folder
  *   notion_id  32-hex Notion page id (from the last path segment, or an explicit alias)
- *   slug       filename without extension, case-folded   ([[home-assistant]] -> home-assistant.md)
+ *   slug       filename without extension, case-folded   ([[home-lab]] -> home-lab.md)
  *   title      case-folded, whitespace-collapsed title
  *
  * resolve() never throws. It returns one of
@@ -5360,7 +5361,7 @@ class Plugin extends AppPlugin {
         const merge = add(mergeRow, 'input', { type: 'radio', name: 'md-clash-mode', id: 'md-clash-merge', checked: false }, 'margin-top: 3px;');
         const mergeText = add(mergeRow, 'span', {}, 'flex: 1;');
         add(mergeText, 'div', { textContent: 'Merge into existing collections' }, 'font-weight: 500;');
-        add(mergeText, 'div', { textContent: 'Records are added to the collections above, and new fields are added to them. A record with the same title as an existing one replaces its content.' }, `color: ${colors.textSecondary}; font-size: 12px;`);
+        add(mergeText, 'div', { textContent: 'Records are added to the collections above, and new fields are added to them. An existing record with the same title and no Source Path is overwritten.' }, `color: ${colors.textSecondary}; font-size: 12px;`);
 
         const problem = add(box, 'div', { id: 'md-clash-problem' }, `margin-top: 8px; color: ${colors.error}; font-size: 12px;`);
         const actions = add(box, 'div', {}, 'display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px;');
