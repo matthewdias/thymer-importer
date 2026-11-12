@@ -4,7 +4,7 @@ const VERSION = 'v0.0.13';
  * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
  * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
- * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title is a warning, not a duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
+ * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title renames the record via its Title property, no duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -4403,7 +4403,7 @@ class Plugin extends AppPlugin {
         };
         add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
-        add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
+        add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
         if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
         add('div', `Links: ${c.linksResolved} resolved, ${c.linksUnresolved} unresolved`);
         add('div', `Images: ${c.assetsUploaded} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`);
@@ -5182,7 +5182,7 @@ class Plugin extends AppPlugin {
 
         const counts = [
             `Collections: ${c.collectionsCreated || 0} created, ${c.collectionsUpdated || 0} updated`,
-            `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
+            `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
             ...(c.valuesCleared ? [`Values cleared (gone from the source): ${c.valuesCleared}`] : []),
             `Links: ${c.linksResolved || 0} resolved, ${c.linksUnresolved || 0} unresolved`,
             `Images/files: ${c.assetsUploaded || 0} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`
@@ -5607,7 +5607,7 @@ class Plugin extends AppPlugin {
                 linksResolved: 0, linksUnresolved: 0,
                 assetsUploaded: 0, assetsFailed: 0,
                 journalCreated: 0, journalSkipped: 0,
-                valuesCleared: 0
+                valuesCleared: 0, recordsRenamed: 0
             },
             unresolvedLinks: [],
             errors: [],
@@ -5915,6 +5915,10 @@ class Plugin extends AppPlugin {
                     continue;
                 }
 
+                // Everything an update needs to READ (current title, which declared fields hold a value) is read here,
+                // before this pass writes anything to the record: Thymer's reads right after a write are stale.
+                const before = isUpdate ? this._planReadUpdateState(ctx, col, def, record) : null;
+
                 if (!isUpdate) {
                     const guid = col.api.createRecord(def.title);
                     if (!guid) throw new Error('createRecord returned null');
@@ -5925,15 +5929,6 @@ class Plugin extends AppPlugin {
                 if (pathKey) existing.byPath.set(pathKey, record);
                 else existing.byTitle.set(titleKey, record);
                 ctx.records.set(def.key, { def, record });
-                if (isUpdate && String(record.getName()).trim() !== String(def.title || '').trim()) {
-                    // The SDK has no way to rename a record (PluginRecord has getName() only, types.d.ts:3305), so the
-                    // record keeps its old title; matching by source_path means it is still updated, not duplicated.
-                    ctx.report.warnings.push({
-                        code: 'title-changed', record: def.key,
-                        message: `"${record.getName()}" is now titled "${def.title}" in the source; the existing record was updated but could not be renamed`
-                    });
-                }
-
                 if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
                     ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
                 }
@@ -5955,7 +5950,10 @@ class Plugin extends AppPlugin {
                     }
                 }
 
-                if (isUpdate) this._planClearAbsentValues(ctx, col, def, record);
+                if (before) {
+                    this._planRenameIfChanged(ctx, def, record, before);
+                    this._planClearAbsentValues(ctx, def, record, before);
+                }
 
                 if (isUpdate) await this._planClearBody(record);
                 if (def.body) {
@@ -5998,25 +5996,44 @@ class Plugin extends AppPlugin {
     }
 
     /**
-     * On an UPDATED record, clears every clearable field (see _planClearableFields) for which this plan gives the record
-     * no value: no scalar value (undefined / null / '' / []) and, for record fields, no planned link. So a cell or a
-     * frontmatter key that was emptied or removed in a later export is emptied here too, instead of keeping the old
-     * value. A relation whose links are planned but cannot be resolved is left alone (the source still has a value).
-     * Cleared values are counted in report.counts.valuesCleared.
+     * Reads, before the pass writes anything to an updated record, what the update needs to know:
+     *   title     the record's current name (for the rename check);
+     *   toClear   the clearable fields (see _planClearableFields) for which this plan gives the record no value (no
+     *             scalar value: undefined / null / '' / [], and for record fields no planned link) AND that hold a value now.
+     * A relation whose links are planned but cannot be resolved is left alone (the source still has a value).
+     * Thymer reads are stale right after a write, so nothing here is ever re-read after the writes that follow.
      */
-    _planClearAbsentValues(ctx, entry, def, record) {
+    _planReadUpdateState(ctx, entry, def, record) {
         if (!ctx.propertyLinkKeys) {
             ctx.propertyLinkKeys = new Set((ctx.plan.links || []).filter(l => l.where === 'property').map(l => `${l.from}\u0000${l.field}`));
         }
         const present = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.filter(x => x !== null && x !== undefined && x !== '').length === 0);
+        const toClear = [];
         for (const fieldId of this._planClearableFields(ctx, entry)) {
             if (present((def.values || {})[fieldId]) || ctx.propertyLinkKeys.has(`${def.key}\u0000${fieldId}`)) continue;
             try {
                 const prop = record.prop(fieldId);
+                const stored = prop && (typeof prop.count === 'function' ? prop.count() : (typeof prop.values === 'function' ? prop.values().length : 0));
+                if (stored > 0) toClear.push(fieldId);
+            } catch (error) {
+                ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be read: ${error && error.message || error}`, record: def.key, field: fieldId });
+            }
+        }
+        return { title: record.getName(), toClear };
+    }
+
+    /**
+     * Clears the fields found by _planReadUpdateState(), so a cell or frontmatter key that was emptied or removed in a
+     * later export is emptied here too. One call per property (_planClearProperty), counted in
+     * report.counts.valuesCleared when it does not throw; a throw is a 'property-not-cleared' warning.
+     */
+    _planClearAbsentValues(ctx, def, record, before) {
+        for (const fieldId of before.toClear) {
+            try {
+                const prop = record.prop(fieldId);
                 if (!prop) continue;
-                const cleared = this._planClearProperty(prop);
-                if (cleared === true) ctx.report.counts.valuesCleared++;
-                else if (cleared === false) ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be cleared`, record: def.key, field: fieldId });
+                this._planClearProperty(prop);
+                ctx.report.counts.valuesCleared++;
             } catch (error) {
                 ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be cleared: ${error && error.message || error}`, record: def.key, field: fieldId });
             }
@@ -6024,26 +6041,45 @@ class Plugin extends AppPlugin {
     }
 
     /**
-     * Empties a property. Returns true when a value was removed, null when there was none, false when it could not be
-     * emptied. The SDK documents set(array) as replacing all values (types.d.ts:2995), so set([]) clears a multi-value
-     * property; for a single-value one set(null) is tried. set(null) is not documented, so success is verified with
-     * count() (types.d.ts:3216: 0 when no value is set) and, if a value is left, removeValueAt(i) (types.d.ts:3014)
-     * and removeValue(v) (types.d.ts:3007, "for single-value properties, clears the value if it matches") follow.
+     * Empties a property with exactly one call: set([]) for a multi-value property (set(array) replaces all values,
+     * types.d.ts:2995) and set(null) for a single-value one. Verified live: both clear every property type. No
+     * read-back and no fallback chain: reads right after a write are stale in Thymer, and a fallback driven by a stale
+     * read (removeValueAt / removeValue) writes a modified copy of the OLD values back. Throws if set() throws.
      */
     _planClearProperty(prop) {
-        const left = () => (typeof prop.count === 'function' ? prop.count() : (typeof prop.values === 'function' ? prop.values().length : 0));
-        if (left() === 0) return null;
         const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
-        const attempts = [
-            () => prop.set(multi ? [] : null),
-            () => { for (let i = left() - 1; i >= 0; i--) prop.removeValueAt(i); },
-            () => { for (const v of (typeof prop.values === 'function' ? prop.values() : [])) prop.removeValue(v); }
-        ];
-        for (const attempt of attempts) {
-            try { attempt(); } catch (e) { /* try the next way */ }
-            if (left() === 0) return true;
+        prop.set(multi ? [] : null);
+    }
+
+    /**
+     * A record matched by source_path whose title changed in the source is renamed through its built-in title property:
+     * record.prop('Title').set(name) (verified live; PluginRecord has no setName, types.d.ts:3305). 'Title' is tried
+     * first, then 'title'. Not verified with getName(), which is stale right after the write. Not done when the
+     * collection has a field of its own called "title" (the lookup could hit that instead).
+     */
+    _planRenameIfChanged(ctx, def, record, before) {
+        const wanted = String(def.title || '').trim();
+        if (!wanted || String(before.title).trim() === wanted) return;
+        const entry = ctx.collections.get(def.collection);
+        const ownTitleField = [...((entry && entry.def.fields) || []), ...((entry && entry.api && entry.api.getConfiguration().fields) || [])]
+            .some(f => [f.id, f.label].some(x => String(x || '').trim().toLowerCase() === 'title'));
+        try {
+            if (!ownTitleField) {
+                for (const name of ['Title', 'title']) {
+                    const prop = record.prop(name);
+                    if (!prop) continue;
+                    prop.set(def.title);
+                    ctx.report.counts.recordsRenamed++;
+                    return;
+                }
+            }
+            ctx.report.warnings.push({
+                code: 'title-not-renamed', record: def.key,
+                message: `"${before.title}" is now titled "${def.title}" in the source; the existing record was updated but ${ownTitleField ? 'the collection has its own "title" field' : 'has no title property to rename'}`
+            });
+        } catch (error) {
+            ctx.report.warnings.push({ code: 'title-not-renamed', record: def.key, message: `could not rename "${before.title}" to "${def.title}": ${error && error.message || error}` });
         }
-        return false;
     }
 
     // ---- dates --------------------------------------------------------------

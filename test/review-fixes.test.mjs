@@ -309,20 +309,58 @@ test('finding 3: a changed title with the same source_path updates the record in
     assert.equal((await all[0].getLineItems(false)).map(i => i.text).join('|'), 'Second body');
 });
 
-test('finding 3: the title change is reported (the SDK has no record rename: PluginRecord only has getName(), types.d.ts:3305)', async () => {
+test('finding 3: a changed title is renamed through the built-in title property, and counted', async () => {
     const { thymer, p } = engine();
     const fields = [];
-    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md' }] }), fast);
-    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New Title', sourcePath: 'notes/a.md' }] }), fast);
-    const warning = report.warnings.find(w => w.code === 'title-changed');
-    assert.ok(warning, JSON.stringify(report.warnings));
-    assert.equal(warning.record, 'a');
-    assert.match(warning.message, /Old Title/);
-    assert.match(warning.message, /New Title/);
-    assert.equal((await thingRecords(thymer))[0].getName(), 'Old Title', 'left as is');
-    // an unchanged title is not reported
-    const again = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md' }] }), fast);
-    assert.equal(again.warnings.filter(w => w.code === 'title-changed').length, 0);
+    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old Title', sourcePath: 'notes/a.md' }, { key: 'b', title: 'Same', sourcePath: 'notes/b.md' }] }), fast);
+    const [guid] = (await thingRecords(thymer)).map(r => r.guid);
+    // reads right after a write are stale in Thymer, so the rename must not be verified (or otherwise depend on) getName()
+    thymer.staleReads = true;
+    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New Title', sourcePath: 'notes/a.md' }, { key: 'b', title: 'Same', sourcePath: 'notes/b.md' }] }), fast);
+    thymer.settle();
+    const all = await thingRecords(thymer);
+    assert.deepEqual(all.map(r => r.getName()).sort(), ['New Title', 'Same']);
+    assert.equal(all.find(r => r.getName() === 'New Title').guid, guid, 'same record, not a duplicate');
+    assert.equal(report.counts.recordsRenamed, 1, 'only the changed title');
+    assert.deepEqual(report.warnings.filter(w => /title/.test(w.code)), []);
+    // nothing changed: nothing renamed
+    const again = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New Title', sourcePath: 'notes/a.md' }] }), fast);
+    assert.equal(again.counts.recordsRenamed, 0);
+});
+
+test('finding 3: the title property is looked up as "Title", then "title"; without one the change is a warning', async () => {
+    for (const [titleProps, renamed] of [[['title'], true], [[], false]]) {
+        const { thymer, p } = engine();
+        thymer.titleProps = titleProps;
+        await p.applyImportPlan(simplePlan(p, { fields: [], records: [{ key: 'a', title: 'Old', sourcePath: 'a.md' }] }), fast);
+        const report = await p.applyImportPlan(simplePlan(p, { fields: [], records: [{ key: 'a', title: 'New', sourcePath: 'a.md' }] }), fast);
+        assert.equal(report.counts.recordsRenamed, renamed ? 1 : 0, JSON.stringify(titleProps));
+        assert.equal((await thingRecords(thymer)).length, 1, 'never a duplicate');
+        assert.equal((await thingRecords(thymer))[0].getName(), renamed ? 'New' : 'Old');
+        assert.equal(report.warnings.some(w => w.code === 'title-not-renamed'), !renamed);
+        assert.equal(report.counts.recordsUpdated, 1);
+    }
+});
+
+test('finding 3: a collection with a field of its own called "Title" is not renamed through the lookup', async () => {
+    const { thymer, p } = engine();
+    const fields = [{ id: 'title', label: 'Title', type: 'text' }];
+    await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'Old', sourcePath: 'a.md', values: { title: 'mine' } }] }), fast);
+    const report = await p.applyImportPlan(simplePlan(p, { fields, records: [{ key: 'a', title: 'New', sourcePath: 'a.md', values: { title: 'mine' } }] }), fast);
+    assert.equal(report.counts.recordsRenamed, 0);
+    assert.equal(report.warnings.filter(w => w.code === 'title-not-renamed').length, 1);
+    assert.equal((await thingRecords(thymer))[0].getName(), 'Old');
+    assert.equal((await thingRecords(thymer))[0].text('title'), 'mine');
+});
+
+test('finding 3: a rename that throws is a warning, and the update still goes through', async () => {
+    const { thymer, p } = engine();
+    await p.applyImportPlan(simplePlan(p, { fields: [{ id: 'note', label: 'Note', type: 'text' }], records: [{ key: 'a', title: 'Old', sourcePath: 'a.md' }] }), fast);
+    (await thingRecords(thymer))[0]._setTitle = () => { throw new Error('read only'); };
+    const report = await p.applyImportPlan(simplePlan(p, { fields: [{ id: 'note', label: 'Note', type: 'text' }], records: [{ key: 'a', title: 'New', sourcePath: 'a.md', values: { note: 'x' } }] }), fast);
+    assert.equal(report.counts.recordsRenamed, 0);
+    assert.match(report.warnings.find(w => w.code === 'title-not-renamed').message, /read only/);
+    assert.equal((await thingRecords(thymer))[0].text('note'), 'x');
 });
 
 test('finding 3: paths are matched trimmed and case-folded', async () => {
@@ -453,20 +491,66 @@ test('finding 6: a field that exists only in another collection of the plan is n
     assert.equal(thymer.recordByTitle('Things', 'A').prop('note').count(), 0);
 });
 
-test('finding 6: clearing falls back to removeValueAt when set(null) does nothing, and a failure is a warning, not a count', async () => {
+test('finding 6: a property is cleared with exactly one set() call, no read-back and no fallback', () => {
+    const { p } = engine();
+    const spy = (multi) => {
+        const calls = [];
+        return {
+            calls,
+            isMultiValue: () => multi,
+            set: (v) => calls.push(['set', v]),
+            count: () => { calls.push(['count']); return 2; }, values: () => { calls.push(['values']); return ['x']; },
+            removeValueAt: () => calls.push(['removeValueAt']), removeValue: () => calls.push(['removeValue'])
+        };
+    };
+    const many = spy(true);
+    p._planClearProperty(many);
+    assert.deepEqual(many.calls, [['set', []]]);
+    const one = spy(false);
+    p._planClearProperty(one);
+    assert.deepEqual(one.calls, [['set', null]]);
+});
+
+test('finding 6: clearing under stale reads (Thymer reads right after a write return the old values) leaves nothing behind', async () => {
     const { thymer, p } = await importedWithValues();
-    thymer.nullSetClears = false;
+    thymer.staleReads = true;
     const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
         { key: 'a', title: 'A', sourcePath: 'a.md', values: {} }, { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
     ] }), fast);
-    assert.deepEqual(propsOf(thymer, 'A'), { note: 0, rating: 0, status: 0, tags: 0, due: 0, rel: 0 });
+    thymer.settle();   // what storage holds now
+    assert.deepEqual(propsOf(thymer, 'A'), { note: 0, rating: 0, status: 0, tags: 0, due: 0, rel: 0 }, 'including the multi-value tags');
     assert.equal(report.counts.valuesCleared, 6);
+    assert.deepEqual(report.warnings.filter(w => w.code === 'property-not-cleared'), [], 'no false failure from a stale read');
+    // one write per cleared property on A, and none that rewrote an old value
+    const a = thymer.recordByTitle('Things', 'A').guid;
+    const writes = thymer.writeLog.filter(w => w.record === a && CLEAR_FIELDS.some(f => f.id === w.field)).slice(-6);
+    assert.ok(writes.every(w => w.value.length === 0), JSON.stringify(writes));
+});
 
-    // a property that cannot be cleared by any documented call
-    const stuck = { count: () => 1, isMultiValue: () => false, set() {}, removeValueAt: () => false, removeValue: () => false, values: () => ['x'] };
-    assert.equal(p._planClearProperty(stuck), false);
-    const empty = { count: () => 0, isMultiValue: () => false, set() { throw new Error('should not be called'); } };
-    assert.equal(p._planClearProperty(empty), null, 'nothing to clear');
+test('finding 6: a property that is already empty is not written again, and is not counted', async () => {
+    const { thymer, p } = await importedWithValues();
+    const plan = () => simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} }, { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] });
+    await p.applyImportPlan(plan(), fast);
+    thymer.settle();
+    thymer.writeLog.length = 0;
+    const second = await p.applyImportPlan(plan(), fast);
+    assert.equal(second.counts.valuesCleared, 0);
+    const bGuid = thymer.recordByTitle('Things', 'B').guid;
+    assert.deepEqual(thymer.writeLog.filter(w => w.field !== 'source_path' && !(w.record === bGuid && w.field === 'note')), [], 'no write to an empty declared field');
+});
+
+test('finding 6: a set() that throws is a warning and is not counted', async () => {
+    const { thymer, p } = await importedWithValues();
+    const a = thymer.recordByTitle('Things', 'A');
+    const real = a.prop.bind(a);
+    a.prop = (name) => { const prop = real(name); if (name === 'rating') prop.set = () => { throw new Error('boom'); }; return prop; };
+    const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} }, { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] }), fast);
+    assert.equal(report.counts.valuesCleared, 5);
+    assert.match(report.warnings.find(w => w.code === 'property-not-cleared').message, /rating.*boom/);
 });
 
 test('finding 6: existing: "skip" never clears', async () => {
