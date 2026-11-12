@@ -190,12 +190,12 @@ test('finding 4: a relation that was a url field (target outside the export) kee
     const url = `https://www.notion.so/Cap-${CAP}`;
     const boards = `e_ExportBlock-1/Boards ${DB_ID}`;
     const caps = `e_ExportBlock-2/Caps ${S_ID}`;
-    const v1 = p._notionBuildPlan(inMemory({ [`${boards}.csv`]: `Name,Caps\nPlanck,${url}\n` }));
+    const v1 = p._notionBuildPlan(inMemory({ [`${boards}.csv`]: `Name,Caps\nBoardy,${url}\n` }));
     assert.equal(v1.collections[0].fields[0].type, 'url', 'sanity: first import is a url field');
     await p.applyImportPlan(v1, fast);
 
     const v2 = p._notionBuildPlan(inMemory({
-        [`${boards}.csv`]: `Name,Caps\nPlanck,${url}\n`,
+        [`${boards}.csv`]: `Name,Caps\nBoardy,${url}\n`,
         [`${caps}.csv`]: 'Name\nCap\n',
         [`${caps}/Cap ${CAP}.md`]: notionPage('Cap')
     }));
@@ -203,10 +203,10 @@ test('finding 4: a relation that was a url field (target outside the export) kee
     thymer.staleReads = true;
     const report = await p.applyImportPlan(v2, fast);
     thymer.settle();
-    const planck = thymer.recordByTitle('Boards', 'Planck');
+    const boardy = thymer.recordByTitle('Boards', 'Boardy');
     assert.equal(fieldsOf(thymer, 'Boards').find(f => f.id === 'caps').type, 'url', 'never retyped');
-    assert.deepEqual(planck.prop('caps').values(), [url], 'the source URL, not an opaque GUID');
-    assert.ok(![...thymer.records.keys()].some(g => planck.prop('caps').values().includes(g)));
+    assert.deepEqual(boardy.prop('caps').values(), [url], 'the source URL, not an opaque GUID');
+    assert.ok(![...thymer.records.keys()].some(g => boardy.prop('caps').values().includes(g)));
     assert.deepEqual(report.warnings, []);
 });
 
