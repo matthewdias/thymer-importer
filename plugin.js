@@ -6281,6 +6281,7 @@ class Plugin extends AppPlugin {
             const entry = ctx.records.get(key);
             ctx.progress(3, `Links in ${entry ? entry.def.title : key}`, done += own.length, links.length);
             if (!entry) continue; // the record itself failed in pass 2 and is already in report.errors
+            if (entry.skipped) continue; // existing: 'skip': an existing record is not written to at all (it stays in the index as a link target)
 
             try {
                 await this._planApplyPropertyLinks(ctx, entry, own.filter(l => l.where === 'property'));
@@ -6386,7 +6387,7 @@ class Plugin extends AppPlugin {
         let done = 0;
         for (const [key, own] of byRecord) {
             const entry = ctx.records.get(key);
-            if (!entry) continue;
+            if (!entry || entry.skipped) continue;   // existing: 'skip' leaves an existing record's body (and so its images) alone
             try {
                 await this._planInsertAssets(ctx, entry, own);
             } catch (error) {
