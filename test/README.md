@@ -11,6 +11,7 @@ Run with `npm test` (Node 20+, no dependencies).
 - `smoke.test.mjs`: plugin loads, CSV parsing.
 - `link-index.test.mjs`: `LinkIndex` alias resolution (path, slug, Notion id, title, ambiguity).
 - `engine.test.mjs`: `applyImportPlan()` against the fake (collections, dedupe, links, unresolved links, multi-value references, assets, journal, failure isolation).
+- `live-fixes.test.mjs`: regressions found in real Thymer: date-only values stored a day early (runs with `TZ=America/Chicago`), stray `!` before links for images that were not imported, empty quote items from blank lines in Notion `<aside>` callouts.
 - `tolaria.test.mjs`: `parseTolariaVault()` over `fixtures/tolaria` (plan snapshots, directory-handle and file-list input, parent-folder pick, idempotent re-import on the fake, dialog glue with a DOM stub).
 - `tolaria-real.test.mjs`: the same parser + `applyImportPlan()` over a real vault; skipped unless `TOLARIA_VAULT` is set. Prints a count summary only.
 - `notion.test.mjs`: `parseNotionExport()` on `fixtures/notion` (plan snapshot, relations, link-by-title candidates, bodies/links/assets/callouts, directory handle vs file list), `applyImportPlan()` on the fake, the dialog's Notion branch with a stub DOM, and the real-export test (skipped unless `NOTION_EXPORT` is set; set `NOTION_EXPECT` to a JSON file outside the repo for exact counts).

@@ -64,11 +64,13 @@ test('column types: BOM stripped, multi-select -> choice many, dates, Yes/No cho
     assert.ok(parsed.parseReport.databases.find(d => d.name === 'Recipes').csv.columnsOnlyInAll.includes('Vegetarian'));
 });
 
-test('values: ISO dates, datetime with time, date range keeps the start, multi-select arrays, numbers', () => {
+test('values: ISO dates, datetime with time, date range keeps both ends, multi-select arrays, numbers', () => {
     assert.equal(rec('Pancakes').values.made_on, '2024-03-03');
     assert.equal(rec('Waffles').values.made_on, '2024-04-01T15:30');
-    assert.equal(rec('Untitled').values.made_on, '2024-05-09');
-    assert.equal(parsed.parseReport.databases.find(d => d.name === 'Recipes').dateRangesTruncated, 1);
+    assert.equal(rec('Untitled').values.made_on, '2024-05-09/2024-05-10');
+    const recipes = parsed.parseReport.databases.find(d => d.name === 'Recipes');
+    assert.equal(recipes.dateRangesKept, 1);
+    assert.equal(recipes.dateRangesTruncated, 0);
     assert.deepEqual(rec('Pancakes').values.tags, ['Breakfast', 'Sweet']);
     assert.deepEqual(rec('Waffles').values.tags, ['Breakfast']);
     assert.equal(rec('Pancakes').values.rating, 4);
@@ -200,7 +202,7 @@ test('images become assets resolved relative to the page; inline data: images ar
 test('<aside> callouts become blockquotes, separated from the paragraph that follows', () => {
     assert.equal(rec('Kitchen Notes').body, [
         '*Written by nobody*', '',
-        '> 💡 **Keep knives sharp.**', '>', '> And tidy.', '>', '> - one', '> - two', '',
+        '> 💡 **Keep knives sharp.**', '> And tidy.', '> - one', '> - two', '',
         'Text right after the callout.', '',
         '> Inline callout', '',
         'See ' + `⟦link:${parsed.links.find(l => l.from === rec('Kitchen Notes').key).id}⟧` + '.'

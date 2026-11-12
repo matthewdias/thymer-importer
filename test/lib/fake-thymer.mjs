@@ -15,12 +15,27 @@ const nextGuid = (prefix) => `${prefix}${(++counter).toString(36).padStart(6, '0
 
 const SEGMENT_TYPES = new Set(['text', 'bold', 'italic', 'code', 'link', 'icon', 'hashtag', 'mention', 'ref', 'linkobj', 'datetime']);
 
+// DateTime (types.d.ts:518). The real DateTimeValue is opaque; this one is readable so tests can tell a
+// date-only value ({ d }) from a timed one ({ d, t }) and see a range end ({ d, r: <end value> }).
 export class FakeDateTime {
-    constructor(d) { this._d = d; }
+    constructor(parts) { this._p = parts; this._end = null; }
     static dateOnly(year, month0, day) {
-        return new FakeDateTime(`${year}${String(month0 + 1).padStart(2, '0')}${String(day).padStart(2, '0')}`);
+        return new FakeDateTime({ y: year, m0: month0, d: day });
     }
-    value() { return { d: this._d }; }
+    static dateAndTime(year, month0, day, hours, minutes, seconds) {
+        return new FakeDateTime({ y: year, m0: month0, d: day, h: hours, mi: minutes, s: seconds });
+    }
+    setRangeEnd(end) { this._end = end; return this; }
+    getRangeEnd() { return this._end; }
+    getParts() { return { ...this._p }; }
+    value() {
+        const p = this._p;
+        const pad = (n) => String(n).padStart(2, '0');
+        const v = { d: `${p.y}${pad(p.m0 + 1)}${pad(p.d)}` };
+        if (p.h !== undefined) v.t = `${pad(p.h)}${pad(p.mi)}${pad(p.s)}`;
+        if (this._end) v.r = this._end.value();
+        return v;
+    }
 }
 
 export class FakeBlob {
@@ -87,7 +102,15 @@ class FakeProperty {
     setFromDate(date) {
         const dates = Array.isArray(date) ? date : [date];
         if (!this.isMultiValue() && dates.length > 1) throw new Error('single-value datetime');
-        this._values = dates.map(d => ({ d: d.toISOString().slice(0, 10).replace(/-/g, '') }));
+        // A Date is an instant, shown in the local timezone with its time of day, which is how Thymer stores it
+        // ("2026-03-01" parses as UTC midnight, so it lands on the previous evening west of UTC).
+        // fromDate marks values that came through here.
+        const pad = (n) => String(n).padStart(2, '0');
+        this._values = dates.map(d => ({
+            d: `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`,
+            t: `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`,
+            fromDate: true
+        }));
     }
     setChoice(names) {
         if (this._field.type !== 'choice') return false;

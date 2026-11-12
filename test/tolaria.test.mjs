@@ -340,7 +340,9 @@ test('applyImportPlan on the fixture: images are uploaded once and inserted afte
     const images = alpha.items.filter(i => i.type === 'image');
     assert.equal(images.length, 2);
     assert.ok(!alpha.items.some(i => i.text.includes('⟦')), 'no placeholder survives');
-    assert.ok(alpha.items.some(i => i.text.includes('![gone](attachments/missing.png)')), 'missing image stays as written');
+    // Thymer's insertFromMarkdown has no image syntax, so a missing or external image is a plain link (no stray "!")
+    assert.ok(alpha.items.some(i => i.text.includes('[gone](attachments/missing.png)') && !i.text.includes('![gone]')), 'missing image becomes a link');
+    assert.ok(alpha.items.some(i => i.text.includes('[web](https://example.invalid/x.png)') && !i.text.includes('![web]')), 'external image becomes a link');
 });
 
 test('re-import is idempotent through source_path', async () => {

@@ -4660,11 +4660,16 @@ class Plugin extends AppPlugin {
         return null;
     }
 
-    /** "A → B" (a Notion date range): the start date, plus whether it was a range. */
+    /**
+     * "A → B" (a Notion date range) -> { value, range, kept }. value is the plan's 'A/B' range form when both ends
+     * parse (kept: true; the engine applies it with DateTime.setRangeEnd), else just the start.
+     */
     _notionDateCell(cell) {
-        const range = String(cell).split(/\s+→\s+/);
-        const start = this._notionParseDate(range[0]);
-        return start ? { value: start, range: range.length > 1 } : null;
+        const parts = String(cell).split(/\s+→\s+/);
+        const start = this._notionParseDate(parts[0]);
+        if (!start) return null;
+        const end = parts.length === 2 ? this._notionParseDate(parts[1]) : null;
+        return { value: end ? `${start}/${end}` : start, range: parts.length > 1, kept: !!end };
     }
 
     /** Splits a relation cell into page ids (from Notion URLs, optionally "Title (url)") and the text left over. */
@@ -4728,7 +4733,8 @@ class Plugin extends AppPlugin {
 
             const dates = values.map(v => this._notionDateCell(v));
             if (dates.every(Boolean)) {
-                db.diag.dateRangesTruncated += dates.filter(d => d.range).length;
+                db.diag.dateRangesTruncated += dates.filter(d => d.range && !d.kept).length;
+                db.diag.dateRangesKept += dates.filter(d => d.kept).length;
                 out.push({ ...col, type: 'datetime' });
                 continue;
             }
@@ -4810,6 +4816,8 @@ class Plugin extends AppPlugin {
                 if (!aside) needBlank = true;   // a quote would otherwise swallow the next line
                 continue;
             }
+            // a blank line inside a callout would become an empty quote item in Thymer; other blockquotes are untouched
+            if (aside && line.trim() === '') continue;
             push(quote(this._notionRewriteInline(ctx, rec, line)));
         }
         return out.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
@@ -4916,7 +4924,7 @@ class Plugin extends AppPlugin {
                     columnsOnlyInAll: db.info.headersOnlyInAll, columnsOnlyInPlain: db.info.headersOnlyInPlain, rowsOnlyInPlain: db.info.rowsOnlyInPlain || 0 },
                 rows: db.rows.length, pages: db.pages.length, matched: 0,
                 rowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
-                dateRangesTruncated: 0, columns: []
+                dateRangesTruncated: 0, dateRangesKept: 0, columns: []
             };
             diag.databases.push(db.diag);
             for (const row of db.rows) {
@@ -5114,6 +5122,8 @@ class Plugin extends AppPlugin {
         if (pr.html && pr.html.asides) notes.push(`${pr.html.asides} <aside> callouts converted to blockquotes`);
         for (const [tag, n] of Object.entries((pr.html && pr.html.otherTags) || {})) notes.push(`<${tag}> appears ${n}× and is imported as-is`);
         if (pr.assets && pr.assets.dataUrisDropped) notes.push(`${pr.assets.dataUrisDropped} inline data: images dropped`);
+        const kept = dbs.reduce((n, d) => n + d.dateRangesKept, 0);
+        if (kept) notes.push(`${kept} date ranges imported as ranges`);
         const ranges = dbs.reduce((n, d) => n + d.dateRangesTruncated, 0);
         if (ranges) notes.push(`${ranges} date ranges imported as their start date`);
         section('Notes', 'info', [...notes, ...(pr.warnings || [])]);
@@ -5202,6 +5212,8 @@ class Plugin extends AppPlugin {
     //       title, sourcePath,   // sourcePath is stored in the source_path field and drives dedupe
     //       aliases?: [{ kind, value }],   // extra LinkIndex aliases (kind: key|path|notion_id|slug|title)
     //       values: { <fieldId>: scalar | scalar[] },   // NOT record-type fields (use links)
+    //                            // 'datetime' fields: 'YYYY-MM-DD' (date only), 'YYYY-MM-DDTHH:MM[:SS]' (local time),
+    //                            // or 'A/B' (a range; A and B each in one of those forms)
     //       body: markdown       // may contain ⟦link:Lx⟧ / ⟦asset:Ax⟧ placeholders
     //     }],
     //     links: [{
@@ -5635,9 +5647,19 @@ class Plugin extends AppPlugin {
                 if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
                     ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
                 }
+                const dateFields = this._planDateFieldIds(ctx.plan, def.collection);
                 for (const [fieldId, value] of Object.entries(def.values || {})) {
                     if (value === null || value === undefined || value === '') continue;
                     if (Array.isArray(value) && value.length === 0) continue;
+                    if (dateFields.has(fieldId)) {
+                        const done = this._planSetDateValue(record, fieldId, value);
+                        if (done === true) continue;
+                        if (done === false) {
+                            ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId} not set`, record: def.key, field: fieldId });
+                            continue;
+                        }
+                        // null: not a date this engine can parse; fall through to the generic setter
+                    }
                     if (!this.setFieldValue(record, fieldId, this.transformValue(value))) {
                         ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId} not set`, record: def.key, field: fieldId });
                     }
@@ -5645,7 +5667,7 @@ class Plugin extends AppPlugin {
 
                 if (isUpdate) await this._planClearBody(record);
                 if (def.body) {
-                    const ok = await record.insertFromMarkdown(this.prepareMarkdownForThymerImport(def.body), null, null);
+                    const ok = await record.insertFromMarkdown(this._planPrepareMarkdown(def.body), null, null);
                     if (!ok) throw new Error('insertFromMarkdown returned false');
                 }
                 ctx.report.counts[isUpdate ? 'recordsUpdated' : 'recordsCreated']++;
@@ -5654,6 +5676,130 @@ class Plugin extends AppPlugin {
                 this._planError(ctx, 2, error, { record: def.key });
             }
         }
+    }
+
+    // ---- dates --------------------------------------------------------------
+
+    /** Ids of the plan fields of type 'datetime' in one collection. */
+    _planDateFieldIds(plan, collectionKey) {
+        const col = (plan.collections || []).find(c => c.key === collectionKey);
+        return new Set(((col && col.fields) || []).filter(f => f.type === 'datetime').map(f => f.id));
+    }
+
+    /**
+     * 'YYYY-MM-DD' | 'YYYY-MM-DDTHH:MM[:SS]' (a space may replace the T) -> { y, m0, d, h?, mi?, s? } (m0 is 0-based),
+     * or null when it is not one of those forms or not a real calendar date/time.
+     */
+    _planParseDatePart(text) {
+        const m = String(text).trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+        if (!m) return null;
+        const [y, m0, d] = [+m[1], +m[2] - 1, +m[3]];
+        const probe = new Date(Date.UTC(y, m0, d));
+        if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m0 || probe.getUTCDate() !== d) return null;
+        if (m[4] === undefined) return { y, m0, d };
+        const [h, mi, s] = [+m[4], +m[5], m[6] === undefined ? 0 : +m[6]];
+        if (h > 23 || mi > 59 || s > 59) return null;
+        return { y, m0, d, h, mi, s };
+    }
+
+    /**
+     * Date-only parts become DateTime.dateOnly() (SDK types.d.ts:532): a calendar day with no time and no timezone.
+     * Date+time parts become DateTime.dateAndTime() (types.d.ts:563) in the browser's local timezone (types.d.ts:484-492).
+     * prop.setFromDate(new Date('2026-03-01')) must NOT be used for these: that Date is UTC midnight, which is the
+     * previous evening in any timezone west of UTC.
+     */
+    _planDateTimeFrom(parts) {
+        return parts.h === undefined
+            ? DateTime.dateOnly(parts.y, parts.m0, parts.d)
+            : DateTime.dateAndTime(parts.y, parts.m0, parts.d, parts.h, parts.mi, parts.s);
+    }
+
+    /** Plan datetime string -> DateTimeValue, or null. 'A/B' is a range (DateTime.setRangeEnd, types.d.ts:700). */
+    _planDateValue(text) {
+        if (typeof text !== 'string' || typeof DateTime === 'undefined') return null;
+        const [a, b, extra] = text.split('/');
+        if (extra !== undefined) return null;
+        const start = this._planParseDatePart(a);
+        if (!start) return null;
+        const dt = this._planDateTimeFrom(start);
+        if (b !== undefined) {
+            const end = this._planParseDatePart(b);
+            if (!end) return null;
+            dt.setRangeEnd(this._planDateTimeFrom(end));
+        }
+        return dt.value();
+    }
+
+    /** true: set; false: the property is missing or rejected the value; null: not a plan date, caller falls back. */
+    _planSetDateValue(record, fieldId, value) {
+        try {
+            const list = Array.isArray(value) ? value.filter(v => v !== null && v !== undefined && v !== '') : [value];
+            const values = list.map(v => this._planDateValue(v));
+            if (values.length === 0 || values.some(v => v === null)) return null;
+            const prop = record.prop(fieldId);
+            if (!prop) return false;
+            const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
+            if (values.length > 1 && !multi) return false;
+            prop.set(Array.isArray(value) && multi ? values : values[0]);   // set(): types.d.ts:2995
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ---- body markdown ------------------------------------------------------
+
+    /** Every body goes through this before insertFromMarkdown(). */
+    _planPrepareMarkdown(markdown) {
+        return this.prepareMarkdownForThymerImport(this._planRewriteStrayImages(markdown));
+    }
+
+    /**
+     * insertFromMarkdown() (types.d.ts:3401) has no image syntax: "![alt](url)" becomes a "!" followed by a link.
+     * By the time a body gets here every image that could be uploaded is an ⟦asset:Ax⟧ placeholder, so what is left
+     * (a missing file, an external URL) becomes a plain link "[alt](url)" (the file name when alt is empty).
+     * Fenced code blocks and inline code are left alone. Thymer does not treat a double-backtick span as code, but
+     * this does: a ``![x](y)`` span in a note is written as code, so it is kept literal, which is what the author meant.
+     */
+    _planRewriteStrayImages(markdown) {
+        if (typeof markdown !== 'string' || !markdown.includes('![')) return markdown;
+        const toLink = (all, alt, url, title) => {
+            if (url.includes('⟦')) return all;   // an asset placeholder is replaced by an image item later
+            let label = alt.trim();
+            if (!label) {
+                const target = url.replace(/^<|>$/g, '');
+                label = target.split(/[?#]/)[0].split('/').filter(Boolean).pop() || target;
+                try { label = decodeURIComponent(label); } catch (e) { /* keep the raw name */ }
+            }
+            return `[${label}](${url}${title || ''})`;
+        };
+        const imageRe = /!\[([^\]\n]*)\]\(\s*(<[^>\n]*>|[^)\s]*)(\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/g;
+        const spanRe = /(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)/g;   // `code` or ``code``: a run of N backticks to the next run of N
+        const rewriteLine = (line) => {
+            let out = '';
+            let last = 0;
+            let m;
+            spanRe.lastIndex = 0;
+            while ((m = spanRe.exec(line))) {
+                out += line.slice(last, m.index).replace(imageRe, toLink) + m[0];
+                last = m.index + m[0].length;
+            }
+            return out + line.slice(last).replace(imageRe, toLink);
+        };
+        let fence = null;   // { char, length } while inside a fenced block
+        return markdown.split('\n').map((line) => {
+            const f = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+            if (fence) {
+                if (f && f[1][0] === fence.char && f[1].length >= fence.length && /^\s*$/.test(line.slice(line.indexOf(f[1]) + f[1].length))) fence = null;
+                return line;
+            }
+            // CommonMark: a backtick fence's info string cannot contain a backtick, so "```x```" is inline code
+            if (f && !(f[1][0] === '`' && line.slice(line.indexOf(f[1]) + f[1].length).includes('`'))) {
+                fence = { char: f[1][0], length: f[1].length };
+                return line;
+            }
+            return line.includes('![') ? rewriteLine(line) : line;
+        }).join('\n');
     }
 
     // ---- placeholders -------------------------------------------------------
@@ -5951,7 +6097,7 @@ class Plugin extends AppPlugin {
                     ctx.report.counts.journalSkipped++;
                     ctx.report.warnings.push({ code: 'journal-page-not-empty', message: `journal page ${entry.date} already has content; skipped` });
                 } else if (entry.markdown) {
-                    if (!(await page.insertFromMarkdown(this.prepareMarkdownForThymerImport(entry.markdown), null, null))) {
+                    if (!(await page.insertFromMarkdown(this._planPrepareMarkdown(entry.markdown), null, null))) {
                         throw new Error('insertFromMarkdown returned false');
                     }
                     ctx.report.counts.journalCreated++;
