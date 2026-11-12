@@ -4174,6 +4174,28 @@ class Plugin extends AppPlugin {
         const props = new Map();       // field id -> { id, variants, items, list, relationKey }
         const noteProps = new Map();   // note -> Map(field id -> raw value)
         const fieldIds = new Map();    // lowercased key -> id
+        // Field ids: one per distinct lowercased key (Status / status share one). slugify() is lossy ("cost ($)" and
+        // "cost (%)" are both "cost"), so ids are made unique ("cost", "cost_2"). They are allocated up front in sorted
+        // key order, not in the order notes happen to be read, so the same vault always maps to the same ids and a
+        // re-import finds the fields it created.
+        const keysWithValues = new Set();
+        for (const note of notes) {
+            for (const [key, raw] of Object.entries(note.frontmatter)) {
+                const lower = key.trim().toLowerCase();
+                if (lower === 'type' || lower.startsWith('_') || DROP.has(lower)) continue;
+                if ((Array.isArray(raw) ? raw : [raw]).some(v => v !== null && v !== undefined && String(v).trim() !== '')) keysWithValues.add(lower);
+            }
+        }
+        const takenIds = new Set();
+        let unnamedKeys = 0;
+        for (const lower of Array.from(keysWithValues).sort()) {
+            let base = this.slugify(lower) || `field_${++unnamedKeys}`;
+            if (base === 'source_path') base = 'source_path_value';
+            let id = base;
+            for (let n = 2; takenIds.has(id); n++) id = `${base}_${n}`;
+            takenIds.add(id);
+            fieldIds.set(lower, id);
+        }
         for (const note of notes) {
             const mine = new Map();
             noteProps.set(note, mine);
@@ -4183,11 +4205,6 @@ class Plugin extends AppPlugin {
                 if (lower.startsWith('_') || DROP.has(lower)) { report.droppedKeys[key] = (report.droppedKeys[key] || 0) + 1; continue; }
                 const items = (Array.isArray(raw) ? raw : [raw]).filter(v => v !== null && v !== undefined && String(v).trim() !== '').map(v => String(v).trim());
                 if (items.length === 0) continue;
-                if (!fieldIds.has(lower)) {
-                    let id = this.slugify(lower) || `field_${fieldIds.size + 1}`;
-                    if (id === 'source_path') id = 'source_path_value';
-                    fieldIds.set(lower, id);
-                }
                 const id = fieldIds.get(lower);
                 if (!props.has(id)) props.set(id, { id, variants: new Set(), items: [], list: false });
                 const prop = props.get(id);

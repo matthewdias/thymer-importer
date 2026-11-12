@@ -144,3 +144,70 @@ test('finding 2: both rows become records, and re-import neither duplicates nor 
     assert.equal(second.counts.recordsCreated, 0);
     assert.equal((await thymer.collection('Tasks').getAllRecords()).length, 6);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Finding 5 (P2): Tolaria field ids must not collide ("cost ($)" and "cost (%)" both slugify to "cost")
+// ---------------------------------------------------------------------------------------------
+
+/** A webkitdirectory-style file list from { 'vault/note.md': text }. */
+function memoryVault(entries) {
+    const files = Object.entries(entries).map(([rel, text]) => {
+        const file = new File([text], rel.split('/').pop());
+        Object.defineProperty(file, 'webkitRelativePath', { value: rel });
+        return file;
+    });
+    return { kind: 'filelist', files };
+}
+const note = (frontmatter, title) => `---\n${frontmatter}\n---\n# ${title}\n\nText.\n`;
+
+test('finding 5: distinct keys that slugify alike get distinct field ids and keep their own values', async () => {
+    const plan = await plugin.parseTolariaVault(memoryVault({
+        'vault/a.md': note('cost ($): 10\nStatus: open', 'A'),
+        'vault/b.md': note('cost (%): 5\nstatus: closed', 'B')
+    }));
+    const fields = plan.collections[0].fields;
+    assert.deepEqual(fields.map(f => f.id).sort(), ['cost', 'cost_2', 'status'], 'two cost fields; Status/status still share one');
+    const idOf = (label) => fields.find(f => f.label === label).id;
+    const a = plan.records.find(r => r.title === 'A');
+    const b = plan.records.find(r => r.title === 'B');
+    assert.equal(a.values[idOf('Cost ($)')], 10);
+    assert.equal(b.values[idOf('Cost (%)')], 5);
+    assert.equal(a.values[idOf('Cost (%)')], undefined);
+    assert.equal(Object.keys(a.values).length, 2);
+    assert.deepEqual(plugin.validateImportPlan(plan), []);
+});
+
+test('finding 5: ids are allocated in sorted key order, so they do not depend on which note comes first', async () => {
+    const one = await plugin.parseTolariaVault(memoryVault({
+        'vault/a.md': note('cost ($): 10', 'First'),
+        'vault/b.md': note('cost (%): 5', 'Second')
+    }));
+    const two = await plugin.parseTolariaVault(memoryVault({
+        'vault/a.md': note('cost (%): 5', 'Second'),
+        'vault/b.md': note('cost ($): 10', 'First')
+    }));
+    const map = (plan) => Object.fromEntries(plan.collections[0].fields.map(f => [f.label, f.id]));
+    assert.deepEqual(map(one), map(two));
+    assert.deepEqual(map(one), { 'Cost ($)': 'cost', 'Cost (%)': 'cost_2' });   // "cost ($)" sorts before "cost (%)"
+});
+
+test('finding 5: a key that slugifies to an already allocated "name_2" does not take it over', async () => {
+    const plan = await plugin.parseTolariaVault(memoryVault({
+        'vault/a.md': note('cost ($): 1\ncost (%): 2\ncost_2: 3', 'A')
+    }));
+    const ids = plan.collections[0].fields.map(f => f.id);
+    assert.equal(new Set(ids).size, 3, ids.join(','));
+    const a = plan.records[0];
+    assert.deepEqual(Object.values(a.values).sort(), [1, 2, 3]);
+});
+
+test('finding 5 (Notion): column ids were already collision-free, including the "(text)" companion', async () => {
+    const stem = `e_ExportBlock-1/Gear ${TASKS_ID}`;
+    const plan = plugin._notionBuildPlan(inMemory({
+        [`${stem}.csv`]: 'Name,Cost ($),Cost (%),Cost\nDrill,10,5,high\n'
+    }));
+    const ids = plan.collections[0].fields.map(f => f.id);
+    assert.deepEqual(ids, ['cost', 'cost_2', 'cost_3']);
+    const drill = plan.records[0];
+    assert.deepEqual(drill.values, { cost: 10, cost_2: 5, cost_3: 'high' });
+});
