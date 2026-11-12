@@ -4613,7 +4613,8 @@ class Plugin extends AppPlugin {
                 info.rowsOnlyInPlain = plain.rows.filter(r => !have.has(this._notionNormTitle(r[0]))).length;
             }
             dbs.push({
-                id: m ? m[2].toLowerCase() : null, name, dir, rowsDir: dir ? `${dir}/${name}` : name,
+                id: m ? m[2].toLowerCase() : null, name, dir, stem: g.stem, rowsDir: dir ? `${dir}/${name}` : name,
+                pathBase: dir ? `${dir}/${name}` : name,   // id-free prefix for the source_path of rows that have no page
                 titleHeader, headers, rows, info, pages: [], records: [], orphans: []
             });
         }
@@ -4898,6 +4899,25 @@ class Plugin extends AppPlugin {
 
     // ---- plan ----------------------------------------------------------------
 
+    /**
+     * The folder that holds a database's row pages. Exports differ: most name it after the database ("Tasks/"), some
+     * after the whole csv file ("Tasks <id>/" next to "Tasks <id>.csv"). Tried in order, taking the first folder that
+     * has pages: the full csv stem; the name without the id; a sibling folder carrying the database id; a sibling that
+     * reads the same once Notion's different character sanitising is ignored. Falls back to the plain name
+     * (the folder then simply has no pages). `dirs` is the set of folders that contain pages.
+     */
+    _notionFindRowsDir(db, dirs, slug) {
+        const parentOf = (d) => d.split('/').slice(0, -1).join('/');
+        const lastOf = (d) => d.split('/').pop();
+        const siblings = Array.from(dirs).filter(d => parentOf(d) === db.dir);
+        const plain = db.dir ? `${db.dir}/${db.name}` : db.name;
+        if (dirs.has(db.stem)) return db.stem;
+        if (dirs.has(plain)) return plain;
+        const byId = db.id && siblings.find(d => lastOf(d).toLowerCase().includes(db.id));
+        if (byId) return byId;
+        return siblings.find(d => slug(lastOf(d)) === slug(db.name)) || plain;
+    }
+
     _notionBuildPlan({ files, texts }, options = {}) {
         const plan = this.createImportPlan('notion');
         const diag = plan.parseReport = {
@@ -4927,12 +4947,7 @@ class Plugin extends AppPlugin {
         const slug = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
         for (const db of dbs) {
             const headerSet = new Set(db.headers);
-            if (!Array.from(pages.values()).some(p => p.dir === db.rowsDir)) {
-                // Notion sanitises characters in folder names differently from the csv's: fall back to a sibling folder that reads the same
-                const alt = Array.from(new Set(Array.from(pages.values()).map(p => p.dir)))
-                    .find(d => d.split('/').slice(0, -1).join('/') === db.dir && slug(d.split('/').pop()) === slug(db.name));
-                if (alt) db.rowsDir = alt;
-            }
+            db.rowsDir = this._notionFindRowsDir(db, new Set(Array.from(pages.values()).map(p => p.dir)), slug);
             for (const page of pages.values()) {
                 if (page.dir !== db.rowsDir) continue;
                 Object.assign(page, this._notionSplitPropertyBlock(page, headerSet));
@@ -4951,22 +4966,41 @@ class Plugin extends AppPlugin {
                 csv: { plain: db.info.plainCsv, all: db.info.allCsv, rowsPlain: db.info.rowsPlain, rowsAll: db.info.rowsAll,
                     columnsOnlyInAll: db.info.headersOnlyInAll, columnsOnlyInPlain: db.info.headersOnlyInPlain, rowsOnlyInPlain: db.info.rowsOnlyInPlain || 0 },
                 rows: db.rows.length, pages: db.pages.length, matched: 0,
-                rowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
+                rowsWithoutPage: [], duplicateRowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
                 dateRangesTruncated: 0, dateRangesKept: 0, columns: []
             };
             diag.databases.push(db.diag);
+            // Rows without a page have no file to identify them. Their source_path is "<database>/<title>" (stable and id-free:
+            // the csv's id would alias the database). Rows that share a title would share that path, and the engine would
+            // overwrite the first with the second, so the 2nd, 3rd, ... occurrence among page-less rows with the same
+            // title gets "#2", "#3", ... in CSV order. The first keeps the plain path, so earlier imports still dedupe.
+            const pagelessSeen = new Map();   // lowercased title -> { title, count }
+            const pagelessPaths = new Set();
             for (const row of db.rows) {
                 const page = row.page;
                 const title = row.title || (page && (page.h1 || page.fileTitle)) || 'Untitled';
+                let sourcePath;
+                if (page) {
+                    sourcePath = page.path;
+                } else {
+                    const seen = pagelessSeen.get(title.trim().toLowerCase()) || { title, count: 0 };
+                    pagelessSeen.set(title.trim().toLowerCase(), seen);
+                    do {
+                        seen.count++;
+                        sourcePath = `${db.pathBase}/${title}${seen.count > 1 ? `#${seen.count}` : ''}`;
+                    } while (pagelessPaths.has(sourcePath.toLowerCase()));
+                    pagelessPaths.add(sourcePath.toLowerCase());
+                }
                 const rec = {
                     key: page && page.id ? `notion:${page.id}` : `notion:${db.id || db.name}:row:${++rowCounter.n}`,
-                    collection: db.key, title,
-                    sourcePath: page ? page.path : `${db.rowsDir}/${title}`,   // a row with no page: stable and id-free (the csv's id would alias the database)
+                    collection: db.key, title, sourcePath,
                     row, page, dir: page ? page.dir : db.rowsDir
                 };
                 if (page) db.diag.matched++; else db.diag.rowsWithoutPage.push(title);
                 db.records.push(rec);
             }
+            db.diag.duplicateRowsWithoutPage = Array.from(pagelessSeen.values()).filter(x => x.count > 1)
+                .map(x => ({ title: x.title, count: x.count, paths: Array.from({ length: x.count }, (_, i) => `${db.pathBase}/${x.title}${i ? `#${i + 1}` : ''}`) }));
             for (const page of db.orphans) {
                 db.diag.pagesWithoutRow.push({ path: page.path, title: page.h1 || page.fileTitle });
                 db.records.push({
@@ -5143,6 +5177,8 @@ class Plugin extends AppPlugin {
         section('Columns that name rows of another database by title (left as text)', 'info',
             (pr.linkByTitleCandidates || []).map(x => `${x.collection}.${x.column} → ${x.targetName}: ${x.matched} of ${x.total} values (${pct(x.share)})${x.ofLeftOverText ? ' of the text cells' : ''}`));
         section('Rows without a page', 'info', dbs.flatMap(d => d.rowsWithoutPage.map(t => `${d.name}: ${t}`)));
+        section('Rows without a page that share a title (kept as separate records; the later ones are matched on re-import by their order in the CSV, source paths …#2, …#3)', 'warning',
+            dbs.flatMap(d => (d.duplicateRowsWithoutPage || []).map(x => `${d.name}: "${x.title}" × ${x.count} (${x.paths.map(p => p.split('/').pop()).join(', ')})`)));
         section('Pages without a CSV row (imported as records)', 'info', dbs.flatMap(d => d.pagesWithoutRow.map(p => `${d.name}: ${p.title}`)));
         section('Empty columns (not imported)', 'info', dbs.flatMap(d => d.emptyColumns.map(h => `${d.name}.${h}`)));
         section('Missing images/files (left as text)', 'warning', ((pr.assets && pr.assets.missing) || []).map(x => `${x.from}: ${x.path}`));
