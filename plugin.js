@@ -4403,6 +4403,7 @@ class Plugin extends AppPlugin {
         add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
         add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
+        if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
         add('div', `Links: ${c.linksResolved} resolved, ${c.linksUnresolved} unresolved`);
         add('div', `Images: ${c.assetsUploaded} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`);
         if (p.unusedTypes && p.unusedTypes.length) add('div', `Types with no notes (no collection created): ${p.unusedTypes.join(', ')}`, 'margin-top: 8px; font-size: 12px;');
@@ -5181,6 +5182,7 @@ class Plugin extends AppPlugin {
         const counts = [
             `Collections: ${c.collectionsCreated || 0} created, ${c.collectionsUpdated || 0} updated`,
             `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
+            ...(c.valuesCleared ? [`Values cleared (gone from the source): ${c.valuesCleared}`] : []),
             `Links: ${c.linksResolved || 0} resolved, ${c.linksUnresolved || 0} unresolved`,
             `Images/files: ${c.assetsUploaded || 0} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`
         ];
@@ -5603,7 +5605,8 @@ class Plugin extends AppPlugin {
                 recordsCreated: 0, recordsUpdated: 0, recordsSkipped: 0, recordsFailed: 0,
                 linksResolved: 0, linksUnresolved: 0,
                 assetsUploaded: 0, assetsFailed: 0,
-                journalCreated: 0, journalSkipped: 0
+                journalCreated: 0, journalSkipped: 0,
+                valuesCleared: 0
             },
             unresolvedLinks: [],
             errors: [],
@@ -5951,6 +5954,8 @@ class Plugin extends AppPlugin {
                     }
                 }
 
+                if (isUpdate) this._planClearAbsentValues(ctx, col, def, record);
+
                 if (isUpdate) await this._planClearBody(record);
                 if (def.body) {
                     const ok = await record.insertFromMarkdown(this._planPrepareMarkdown(def.body), null, null);
@@ -5962,6 +5967,82 @@ class Plugin extends AppPlugin {
                 this._planError(ctx, 2, error, { record: def.key });
             }
         }
+    }
+
+    // ---- clearing values that are gone from the source -----------------------
+
+    /** Ids that are never cleared, whatever a plan declares: the engine's own field and Thymer's built-in ones. */
+    static get _PLAN_PROTECTED_FIELDS() {
+        return new Set(['source_path', 'title', 'name', 'created_at', 'updated_at', 'created_by', 'updated_by', 'id', 'guid']);
+    }
+
+    /**
+     * The field ids that may be cleared on an updated record of one collection: the fields this plan DECLARES for it
+     * (def.fields, which is the source's truth, even if no record in this export has a value for one, e.g. a column
+     * that is now empty everywhere), that exist and are active and writable in the persisted collection, and are not a
+     * built-in or system field or source_path. Fields the plan does not declare (added by hand in Thymer, or declared
+     * only for another collection) are never in this set. Cached per collection.
+     */
+    _planClearableFields(ctx, entry) {
+        if (entry.clearable) return entry.clearable;
+        const persisted = new Map(((entry.api && entry.api.getConfiguration().fields) || []).map(f => [f.id, f]));
+        const protectedIds = Plugin._PLAN_PROTECTED_FIELDS;
+        entry.clearable = new Set((entry.def.fields || [])
+            .map(fd => fd.id || this.slugify(fd.label))
+            .filter(id => {
+                const have = persisted.get(id);
+                return id && !protectedIds.has(id) && have && have.active !== false && have.read_only !== true;
+            }));
+        return entry.clearable;
+    }
+
+    /**
+     * On an UPDATED record, clears every clearable field (see _planClearableFields) for which this plan gives the record
+     * no value: no scalar value (undefined / null / '' / []) and, for record fields, no planned link. So a cell or a
+     * frontmatter key that was emptied or removed in a later export is emptied here too, instead of keeping the old
+     * value. A relation whose links are planned but cannot be resolved is left alone (the source still has a value).
+     * Cleared values are counted in report.counts.valuesCleared.
+     */
+    _planClearAbsentValues(ctx, entry, def, record) {
+        if (!ctx.propertyLinkKeys) {
+            ctx.propertyLinkKeys = new Set((ctx.plan.links || []).filter(l => l.where === 'property').map(l => `${l.from}\u0000${l.field}`));
+        }
+        const present = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.filter(x => x !== null && x !== undefined && x !== '').length === 0);
+        for (const fieldId of this._planClearableFields(ctx, entry)) {
+            if (present((def.values || {})[fieldId]) || ctx.propertyLinkKeys.has(`${def.key}\u0000${fieldId}`)) continue;
+            try {
+                const prop = record.prop(fieldId);
+                if (!prop) continue;
+                const cleared = this._planClearProperty(prop);
+                if (cleared === true) ctx.report.counts.valuesCleared++;
+                else if (cleared === false) ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be cleared`, record: def.key, field: fieldId });
+            } catch (error) {
+                ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be cleared: ${error && error.message || error}`, record: def.key, field: fieldId });
+            }
+        }
+    }
+
+    /**
+     * Empties a property. Returns true when a value was removed, null when there was none, false when it could not be
+     * emptied. The SDK documents set(array) as replacing all values (types.d.ts:2995), so set([]) clears a multi-value
+     * property; for a single-value one set(null) is tried. set(null) is not documented, so success is verified with
+     * count() (types.d.ts:3216: 0 when no value is set) and, if a value is left, removeValueAt(i) (types.d.ts:3014)
+     * and removeValue(v) (types.d.ts:3007, "for single-value properties, clears the value if it matches") follow.
+     */
+    _planClearProperty(prop) {
+        const left = () => (typeof prop.count === 'function' ? prop.count() : (typeof prop.values === 'function' ? prop.values().length : 0));
+        if (left() === 0) return null;
+        const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
+        const attempts = [
+            () => prop.set(multi ? [] : null),
+            () => { for (let i = left() - 1; i >= 0; i--) prop.removeValueAt(i); },
+            () => { for (const v of (typeof prop.values === 'function' ? prop.values() : [])) prop.removeValue(v); }
+        ];
+        for (const attempt of attempts) {
+            try { attempt(); } catch (e) { /* try the next way */ }
+            if (left() === 0) return true;
+        }
+        return false;
     }
 
     // ---- dates --------------------------------------------------------------

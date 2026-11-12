@@ -88,6 +88,13 @@ class FakeProperty {
     }
 
     set(v) {
+        if (v === null || v === undefined) {
+            // The SDK documents set(array) replacing all values (types.d.ts:2995) but not set(null). The fake clears on
+            // null by default; thymer.nullSetClears = false models a Thymer where it is a no-op, so the engine's
+            // fallbacks (removeValueAt, removeValue) are exercised.
+            if (this._thymer.nullSetClears !== false) this._values = [];
+            return;
+        }
         if (Array.isArray(v)) {
             if (!this.isMultiValue()) throw new Error(`${this._field.id} is single-value; cannot set an array`);
             this._values = v.map(x => this._coerce(x));
@@ -98,6 +105,19 @@ class FakeProperty {
     addValue(v) {
         if (!this.isMultiValue()) return this.set(v);
         this._values = [...this._values, this._coerce(v)];
+    }
+    /** types.d.ts:3007: removes a value by strict equality; clears a single-value property if it matches. */
+    removeValue(v) {
+        const i = this._values.findIndex(x => x === v);
+        if (i < 0) return false;
+        this._values = this._values.filter((_, j) => j !== i);
+        return true;
+    }
+    /** types.d.ts:3014 */
+    removeValueAt(index) {
+        if (!Number.isInteger(index) || index < 0 || index >= this._values.length) return false;
+        this._values = this._values.filter((_, j) => j !== index);
+        return true;
     }
     setFromDate(date) {
         const dates = Array.isArray(date) ? date : [date];
@@ -338,6 +358,7 @@ export class FakeThymer {
         this.blobs = new Map();
         this.failCreateTitles = new Set();
         this.failUploadNames = new Set();
+        this.nullSetClears = true;        // does PluginProperty.set(null) clear a value? (not pinned down by types.d.ts)
         this.rejected = [];               // reasons setSegments() refused a segment list
         this.expandingGetLineItems = 0;   // getLineItems() calls that did not pass false
         this.users = [{ guid: 'user1' }];

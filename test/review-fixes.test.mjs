@@ -354,3 +354,155 @@ test('finding 3: a record with no source_path is still adopted by title, once; a
     assert.equal(third.counts.recordsCreated, 0);
     assert.equal((await thingRecords(thymer)).length, 3);
 });
+
+// ---- Finding 6 --------------------------------------------------------------------------------
+
+const CLEAR_FIELDS = [
+    { id: 'note', label: 'Note', type: 'text' },
+    { id: 'rating', label: 'Rating', type: 'number' },
+    { id: 'status', label: 'Status', type: 'choice' },
+    { id: 'tags', label: 'Tags', type: 'choice', many: true },
+    { id: 'due', label: 'Due', type: 'datetime' },
+    { id: 'rel', label: 'Related', type: 'record', many: true, target: 'things' }
+];
+const FULL = { note: 'hello', rating: 4, status: 'open', tags: ['a', 'b'], due: '2026-03-01' };
+
+/** Imports a full record "A" (and a second record "B" it relates to), then returns the pieces. */
+async function importedWithValues() {
+    const { thymer, p } = engine();
+    const plan = simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: { ...FULL } },
+        { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] });
+    p.planPropertyLink(plan, 'a', 'rel', { ref: 'b', kind: 'key' });
+    const first = await p.applyImportPlan(plan, fast);
+    assert.equal(first.counts.valuesCleared, 0, 'nothing is cleared on create');
+    return { thymer, p };
+}
+const propsOf = (thymer, title) => Object.fromEntries(CLEAR_FIELDS.map(f => [f.id, thymer.recordByTitle('Things', title).prop(f.id).count()]));
+
+test('finding 6: values that are gone from the source are cleared on re-import, and counted', async () => {
+    const { thymer, p } = await importedWithValues();
+    assert.deepEqual(propsOf(thymer, 'A'), { note: 1, rating: 1, status: 1, tags: 2, due: 1, rel: 1 });
+
+    // the same fields are declared, but record A no longer has any value, nor a relation
+    const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} },
+        { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] }), fast);
+    assert.deepEqual(propsOf(thymer, 'A'), { note: 0, rating: 0, status: 0, tags: 0, due: 0, rel: 0 });
+    assert.equal(report.counts.valuesCleared, 6, 'one per property that had a value');
+    assert.deepEqual(report.warnings.filter(w => w.code === 'property-not-cleared'), []);
+    assert.equal(thymer.recordByTitle('Things', 'B').text('note'), 'keep me', 'B still has its value');
+});
+
+test('finding 6: values that are still present are kept; empty strings and empty arrays count as absent', async () => {
+    const { thymer, p } = await importedWithValues();
+    const plan = simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: { note: 'changed', rating: null, status: '', tags: [] } },
+        { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] });
+    p.planPropertyLink(plan, 'a', 'rel', { ref: 'b', kind: 'key' });   // the relation is still in the source
+    const report = await p.applyImportPlan(plan, fast);
+    const a = thymer.recordByTitle('Things', 'A');
+    assert.equal(a.text('note'), 'changed');
+    assert.equal(a.prop('rel').count(), 1, 'a planned relation is not cleared');
+    assert.deepEqual(['rating', 'status', 'tags', 'due'].map(id => a.prop(id).count()), [0, 0, 0, 0]);
+    assert.equal(report.counts.valuesCleared, 3 + 1, 'rating, status, tags and due were absent');
+});
+
+test('finding 6: only fields the plan declares for that collection are touched (user fields, source_path, read-only fields are not)', async () => {
+    const { thymer, p } = await importedWithValues();
+    const things = thymer.collection('Things');
+    // a field the user added in Thymer, with a value on A
+    things.config.fields.push({ id: 'mine', label: 'Mine', type: 'text', icon: 'ti-x', many: false, read_only: false, active: true });
+    thymer.recordByTitle('Things', 'A').prop('mine').set('user data');
+    // a declared field that is read-only in the persisted collection
+    things.config.fields.find(f => f.id === 'note').read_only = true;
+
+    const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} },
+        { key: 'b', title: 'B', sourcePath: 'b.md', values: {} }
+    ] }), fast);
+    const a = thymer.recordByTitle('Things', 'A');
+    assert.equal(a.text('mine'), 'user data', 'undeclared field untouched');
+    assert.equal(a.text('source_path'), 'a.md', 'source_path untouched');
+    assert.equal(a.text('note'), 'hello', 'read-only persisted field untouched');
+    assert.equal(thymer.recordByTitle('Things', 'B').text('note'), 'keep me');
+    assert.equal(a.prop('rating').count(), 0, 'declared, writable fields are cleared');
+    assert.ok(report.counts.valuesCleared >= 5);
+});
+
+test('finding 6: a field that exists only in another collection of the plan is not cleared here', async () => {
+    const { thymer, p } = engine();
+    const plan = p.createImportPlan('synthetic');
+    plan.collections.push(
+        { key: 'things', name: 'Things', icon: 'ti-box', description: '', fields: [{ id: 'note', label: 'Note', type: 'text' }] },
+        { key: 'others', name: 'Others', icon: 'ti-box', description: '', fields: [{ id: 'extra', label: 'Extra', type: 'text' }] }
+    );
+    plan.records.push({ key: 'a', collection: 'things', title: 'A', sourcePath: 'a.md', values: { note: 'n' }, body: '' });
+    await p.applyImportPlan(plan, fast);
+    // someone adds "extra" to Things by hand and fills it
+    thymer.collection('Things').config.fields.push({ id: 'extra', label: 'Extra', type: 'text', icon: 'ti-x', many: false, read_only: false, active: true });
+    thymer.recordByTitle('Things', 'A').prop('extra').set('by hand');
+    const plan2 = p.createImportPlan('synthetic');
+    plan2.collections.push(...plan.collections);
+    plan2.records.push({ key: 'a', collection: 'things', title: 'A', sourcePath: 'a.md', values: {}, body: '' });
+    await p.applyImportPlan(plan2, fast);
+    assert.equal(thymer.recordByTitle('Things', 'A').text('extra'), 'by hand');
+    assert.equal(thymer.recordByTitle('Things', 'A').prop('note').count(), 0);
+});
+
+test('finding 6: clearing falls back to removeValueAt when set(null) does nothing, and a failure is a warning, not a count', async () => {
+    const { thymer, p } = await importedWithValues();
+    thymer.nullSetClears = false;
+    const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} }, { key: 'b', title: 'B', sourcePath: 'b.md', values: { note: 'keep me' } }
+    ] }), fast);
+    assert.deepEqual(propsOf(thymer, 'A'), { note: 0, rating: 0, status: 0, tags: 0, due: 0, rel: 0 });
+    assert.equal(report.counts.valuesCleared, 6);
+
+    // a property that cannot be cleared by any documented call
+    const stuck = { count: () => 1, isMultiValue: () => false, set() {}, removeValueAt: () => false, removeValue: () => false, values: () => ['x'] };
+    assert.equal(p._planClearProperty(stuck), false);
+    const empty = { count: () => 0, isMultiValue: () => false, set() { throw new Error('should not be called'); } };
+    assert.equal(p._planClearProperty(empty), null, 'nothing to clear');
+});
+
+test('finding 6: existing: "skip" never clears', async () => {
+    const { thymer, p } = await importedWithValues();
+    const report = await p.applyImportPlan(simplePlan(p, { fields: CLEAR_FIELDS, records: [
+        { key: 'a', title: 'A', sourcePath: 'a.md', values: {} }, { key: 'b', title: 'B', sourcePath: 'b.md', values: {} }
+    ] }), { ...fast, existing: 'skip' });
+    assert.equal(report.counts.valuesCleared, 0);
+    assert.equal(thymer.recordByTitle('Things', 'A').text('note'), 'hello');
+});
+
+test('finding 6 (Notion): an emptied csv cell is cleared on re-import', async () => {
+    const stem = `e_ExportBlock-1/Gear ${TASKS_ID}`;
+    const plan1 = plugin._notionBuildPlan(inMemory({ [`${stem}.csv`]: 'Name,Status,Rating\nDrill,Open,5\nSaw,Done,3\n' }));
+    const plan2 = plugin._notionBuildPlan(inMemory({ [`${stem}.csv`]: 'Name,Status,Rating\nDrill,,5\nSaw,Done,\n' }));
+    const thymer = new FakeThymer();
+    plugin.data = thymer.data;
+    await plugin.applyImportPlan(plan1, fast);
+    const report = await plugin.applyImportPlan(plan2, fast);
+    assert.equal(thymer.recordByTitle('Gear', 'Drill').prop('status').count(), 0);
+    assert.equal(thymer.recordByTitle('Gear', 'Drill').number('rating'), 5);
+    assert.equal(thymer.recordByTitle('Gear', 'Saw').prop('rating').count(), 0);
+    assert.equal(thymer.recordByTitle('Gear', 'Saw').text('status'), 'Done');
+    assert.equal(report.counts.valuesCleared, 2);
+    assert.equal(plugin._notionSummarize(plan2, report).counts.some(l => /Values cleared.*: 2$/.test(l)), true, 'the report line');
+});
+
+test('finding 6 (Tolaria): a frontmatter key removed from a note is cleared on re-import', async () => {
+    const v1 = memoryVault({ 'vault/a.md': note('cadence: weekly\nurl: https://example.invalid/a', 'A'), 'vault/b.md': note('cadence: daily', 'B') });
+    const v2 = memoryVault({ 'vault/a.md': note('url: https://example.invalid/a', 'A'), 'vault/b.md': note('cadence: daily', 'B') });
+    const thymer = new FakeThymer();
+    plugin.data = thymer.data;
+    await plugin.applyImportPlan(await plugin.parseTolariaVault(v1), fast);
+    const report = await plugin.applyImportPlan(await plugin.parseTolariaVault(v2), fast);
+    assert.equal(thymer.recordByTitle('Notes', 'A').prop('cadence').count(), 0);
+    assert.equal(thymer.recordByTitle('Notes', 'B').text('cadence'), 'daily');
+    assert.equal(thymer.recordByTitle('Notes', 'A').text('url'), 'https://example.invalid/a');
+    assert.equal(report.counts.valuesCleared, 1);
+});
