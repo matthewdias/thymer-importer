@@ -5326,12 +5326,19 @@ class Plugin extends AppPlugin {
             const fields = (api.getConfiguration() || {}).fields || [];
             if (!fields.some(f => f && f.id === 'source_path')) return 'no-source-path-field';
             const planned = new Set();
+            const plannedIds = new Set();   // Notion page ids: a page renamed since the last import has a new path but the same id
             for (const rec of plan.records || []) {
-                if (rec.collection === def.key && rec.sourcePath) planned.add(String(rec.sourcePath).trim().toLowerCase());
+                if (rec.collection !== def.key) continue;
+                if (rec.sourcePath) planned.add(String(rec.sourcePath).trim().toLowerCase());
+                const id = this._planNotionIdOf(rec);
+                if (id) plannedIds.add(id);
             }
             for (const record of await api.getAllRecords()) {
                 const path = typeof record.text === 'function' ? record.text('source_path') : null;
-                if (path && planned.has(String(path).trim().toLowerCase())) return null;
+                if (!path) continue;
+                if (planned.has(String(path).trim().toLowerCase())) return null;
+                const id = LinkIndex.extractNotionId(String(path).trim().split('/').pop());
+                if (id && plannedIds.has(id)) return null;
             }
             return 'no-matching-records';
         } catch (error) {
@@ -5847,21 +5854,45 @@ class Plugin extends AppPlugin {
 
     /**
      * Existing records of a collection, indexed for re-import:
-     *   byPath  source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
-     *   byTitle title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
-     * A record that has a source_path is identified by it alone, so a changed title cannot create a duplicate.
+     *   byPath      source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
+     *   byNotionId  the 32-hex Notion page id in the file name of a source_path ("Title <id>.md") -> record. A page renamed
+     *               in Notion changes its path but not its id, so the id identifies it across renames;
+     *   byTitle     title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
+     * A record that has a source_path is identified by it (or its Notion id) alone, so a changed title cannot create a
+     * duplicate. pathOf / idOf are the reverse maps, kept current as records are matched.
      * executeImport() (CSV / Obsidian / ...) keeps its own source_path||title key; only the engine uses this.
      */
     async _planExistingRecords(collection) {
         const norm = (text) => String(text || '').trim().toLowerCase();
         const byPath = new Map();
         const byTitle = new Map();
+        const byNotionId = new Map();
+        const pathOf = new Map();
+        const idOf = new Map();
         for (const record of await collection.getAllRecords()) {
             const pathValue = norm(typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '');
-            if (pathValue) byPath.set(pathValue, record);
-            else if (norm(record.getName())) byTitle.set(norm(record.getName()), record);
+            if (pathValue) {
+                byPath.set(pathValue, record);
+                pathOf.set(record, pathValue);
+                const id = LinkIndex.extractNotionId(pathValue.split('/').pop());
+                if (id) { idOf.set(record, id); if (!byNotionId.has(id)) byNotionId.set(id, record); }
+            } else if (norm(record.getName())) {
+                byTitle.set(norm(record.getName()), record);
+            }
         }
-        return { byPath, byTitle, norm };
+        return { byPath, byTitle, byNotionId, pathOf, idOf, norm };
+    }
+
+    /** The Notion page id a plan record stands for: its notion_id alias, else a "notion:<32 hex>" key; null for records without one. */
+    _planNotionIdOf(def) {
+        for (const alias of (def && def.aliases) || []) {
+            if (alias && alias.kind === 'notion_id') {
+                const id = LinkIndex.extractNotionId(alias.value);
+                if (id) return id;
+            }
+        }
+        const m = String((def && def.key) || '').match(/^notion:([0-9a-f]{32})$/i);
+        return m ? m[1].toLowerCase() : null;
     }
 
     /** Deletes a record's body (children first). Never follows references into other records. */
@@ -5898,7 +5929,14 @@ class Plugin extends AppPlugin {
                 const existing = existingByCollection.get(def.collection);
                 const pathKey = existing.norm(def.sourcePath);
                 const titleKey = existing.norm(def.title);
-                let found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                // A Notion page is first looked up by its page id (its path changes when the page is renamed). A path match
+                // is not taken when that record belongs to a different page.
+                const notionId = this._planNotionIdOf(def);
+                let found = notionId ? existing.byNotionId.get(notionId) : undefined;
+                if (!found) {
+                    found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                    if (found && notionId && existing.idOf.get(found) && existing.idOf.get(found) !== notionId) found = undefined;
+                }
                 if (!found && pathKey) {
                     // Adopt a record that has the same title but no source_path yet, once only
                     // (a record that has a source_path is never taken by title).
@@ -5926,8 +5964,12 @@ class Plugin extends AppPlugin {
                     await this._planSleep(ctx, ctx.opts.settleMs ?? 300);
                 }
                 ctx.index.bind(def.key, record.guid);
-                if (pathKey) existing.byPath.set(pathKey, record);
+                // the record now answers to this run's path (it may have been renamed in the source) and page id
+                const oldPath = existing.pathOf.get(record);
+                if (oldPath && oldPath !== pathKey && existing.byPath.get(oldPath) === record) existing.byPath.delete(oldPath);
+                if (pathKey) { existing.byPath.set(pathKey, record); existing.pathOf.set(record, pathKey); }
                 else existing.byTitle.set(titleKey, record);
+                if (notionId) { existing.byNotionId.set(notionId, record); existing.idOf.set(record, notionId); }
                 ctx.records.set(def.key, { def, record });
                 if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
                     ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
