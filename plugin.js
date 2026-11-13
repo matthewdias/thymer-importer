@@ -4382,11 +4382,38 @@ class Plugin extends AppPlugin {
         }
     }
 
+    /**
+     * Every warning of a run, for the Tolaria and Notion reports, grouped by code:
+     *   [{ code, count, examples: [string], more }]  most frequent first (ties keep the order they first appeared in).
+     * The engine's warnings (report.warnings: { code, message, record?, collection?, field? }) group by their own code; what the
+     * parser noted while reading the source (plan.parseReport.warnings, plain strings) is one group with the code 'reading'.
+     * An example is "<record title>: <message>". `total` is the number of warnings, which decides "Finished with warnings".
+     */
+    _importWarnings(plan, report, { maxExamples = 3 } = {}) {
+        const titles = new Map(((plan && plan.records) || []).map(r => [r.key, r.title]));
+        const groups = new Map();
+        const add = (code, text) => {
+            if (!groups.has(code)) groups.set(code, { code, count: 0, examples: [], more: 0 });
+            const g = groups.get(code);
+            g.count++;
+            if (g.examples.length < maxExamples) g.examples.push(text); else g.more++;
+        };
+        for (const w of (report && report.warnings) || []) {
+            if (!w || typeof w !== 'object') { add('warning', String(w)); continue; }
+            const where = w.record ? (titles.get(w.record) || w.record) : (w.collection || '');
+            add(w.code || 'warning', `${where ? `${where}: ` : ''}${w.message || w.code || 'warning'}`);
+        }
+        for (const text of (plan && plan.parseReport && plan.parseReport.warnings) || []) add('reading', String(text));
+        const list = Array.from(groups.values()).sort((a, b) => b.count - a.count);
+        return { groups: list, total: list.reduce((n, g) => n + g.count, 0) };
+    }
+
     renderTolariaReport(statusDiv, plan, report) {
         const c = report.counts;
         const p = plan.parseReport || {};
         const failed = report.errors.length > 0 || c.recordsFailed > 0;
-        this.showStatus(statusDiv, '', failed ? 'warning' : 'success');
+        const warned = this._importWarnings(plan, report);
+        this.showStatus(statusDiv, '', failed || warned.total ? 'warning' : 'success');
         statusDiv.style.textAlign = 'left';
         const add = (tag, text, style = '') => {
             const el = document.createElement(tag);
@@ -4402,7 +4429,7 @@ class Plugin extends AppPlugin {
             if (items.length > limit) { const li = document.createElement('li'); li.textContent = `...and ${items.length - limit} more`; ul.appendChild(li); }
             statusDiv.appendChild(ul);
         };
-        add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
+        add('div', failed ? 'Finished with problems' : (warned.total ? 'Finished with warnings' : 'Import complete'), 'font-weight: 600;');
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
         add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
         if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
@@ -4423,6 +4450,13 @@ class Plugin extends AppPlugin {
         if (report.errors.length) {
             add('div', 'Errors:', 'margin-top: 8px; font-weight: 600; font-size: 12px;');
             list(report.errors.map(e => `${e.record || e.collection || e.asset || `pass ${e.pass}`}: ${e.message}`));
+        }
+        if (warned.total) {
+            add('div', `Warnings (${warned.total}):`, 'margin-top: 8px; font-weight: 600; font-size: 12px;');
+            for (const g of warned.groups) {
+                add('div', `${g.code} (${g.count})`, 'margin-top: 4px; font-size: 12px;');
+                list([...g.examples, ...(g.more ? [`...and ${g.more} more`] : [])]);
+            }
         }
     }
 
@@ -5213,13 +5247,18 @@ class Plugin extends AppPlugin {
         if (kept) notes.push(`${kept} date ranges imported as ranges`);
         const ranges = dbs.reduce((n, d) => n + d.dateRangesTruncated, 0);
         if (ranges) notes.push(`${ranges} date ranges imported as their start date`);
-        section('Notes', 'info', [...notes, ...(pr.warnings || [])]);
+        section('Notes', 'info', notes);
         section('Errors', 'error', ((report && report.errors) || []).map(e => `pass ${e.pass}${e.record ? ` / ${e.record}` : ''}: ${e.message}`));
-        section('Warnings', 'warning', ((report && report.warnings) || []).map(w => w.message || String(w)));
+        // warnings: one section per code, with the count and the first few examples (the engine's and the parser's)
+        const warned = this._importWarnings(plan, report);
+        for (const g of warned.groups) {
+            sections.push({ title: `Warnings: ${g.code} (${g.count})`, tone: 'warning', items: [...g.examples, ...(g.more ? [`…and ${g.more} more`] : [])] });
+        }
 
         const failed = (c.recordsFailed || 0) + ((report && report.errors) || []).length;
         return {
-            headline: `${plan.collections.length} collection(s), ${plan.records.length} record(s)${failed ? `, ${failed} problem(s)` : ''}`,
+            headline: `${plan.collections.length} collection(s), ${plan.records.length} record(s)${failed ? `, ${failed} problem(s)` : ''}${warned.total ? `, ${warned.total} warning(s)` : ''}`,
+            problems: failed, warnings: warned.total,
             counts, sections
         };
     }
@@ -5271,7 +5310,7 @@ class Plugin extends AppPlugin {
                 onProgress: ({ message, done, total }) => this.showStatus(statusDiv, total ? `${message} (${done}/${total})` : message, 'info')
             });
             const summary = this._notionSummarize(plan, report);
-            this.showStatus(statusDiv, `${report.errors.length ? 'Finished with problems' : 'Complete!'} ${summary.headline}`, report.errors.length ? 'warning' : 'success');
+            this.showStatus(statusDiv, `${report.errors.length ? 'Finished with problems' : (summary.warnings ? 'Finished with warnings' : 'Complete!')} ${summary.headline}`, report.errors.length || summary.warnings ? 'warning' : 'success');
             reportDiv.innerHTML = this._notionReportHtml(summary, this.getThemeColors());
             cancelBtn.textContent = 'Close';
         } catch (error) {
