@@ -91,6 +91,18 @@ A third review found four more ways a later export could disagree with what an e
   - A relation's unresolved text goes to the "(text)" companion as the URL / text list it always did.
   - Two look-alike keys that already existed under one shared label (imported before this round) are matched by id.
 
+### Fixes (soft line breaks, Tolaria)
+
+Found in real use: Tolaria notes are often hard-wrapped at about 80 columns, and **`insertFromMarkdown`** made every source line its own item. A wrapped list item became one list item followed by one **text** item per continuation line, each keeping the continuation's leading spaces; a wrapped paragraph became one item per line. In Thymer, at a narrower reading width, that shows as ragged gaps in the text.
+
+- **Soft breaks are joined before the body is inserted.** In Markdown a single line break inside a paragraph, list item or quote is a space, so the engine now joins such lines with one space (the continuation's leading whitespace dropped). It applies to record bodies and journal entries, and only when the plan opts in with **`plan.options.unwrapSoftBreaks`**. **Tolaria opts in. Notion does not**: Notion exports a Shift+Enter line break inside a block as a plain newline, and those breaks are intentional, so Notion bodies reach Thymer byte for byte as before.
+- **Not joined:** a line is not joined to the line before it when that line is a heading, a fence, a table row, a thematic break, an html line or only a **`⟦link:…⟧` / `⟦asset:…⟧`** placeholder, or ends in a **hard break** (two or more trailing spaces, or a backslash); and a line that starts a block is never joined onto the previous line: ATX heading, list marker (**`-`**, **`*`**, **`+`**, **`1.`**, **`1)`**, at any indentation, so nested lists keep their nesting), blockquote, fence (backticks or tildes), table, thematic break, setext underline, html, or a line that is only a placeholder.
+- **Hard breaks** keep their newline (Thymer has no line break inside an item), lose the two spaces or backslash, and the line after them loses its indentation.
+- **Quotes:** **`> foo`** then **`> bar`** becomes **`> foo bar`**; lines are never joined across a quote / non-quote boundary or between different quote depths, and a **`> [!note]`** callout header keeps its own line.
+- **Left untouched:** fenced code (backticks and tildes, at any indentation, also inside a list item), indented code (4 or more spaces past the enclosing list item, after a blank line or a non-paragraph block; it cannot interrupt a paragraph, and 4 spaces inside a list item are a normal continuation), tables (with or without leading pipes), html blocks, **`<!-- -->`** and **`<pre>`**, and **`$$`** blocks.
+- **Placeholders** are plain text to the joiner. A link or image placeholder that ends up in the middle of a joined paragraph is resolved as before: the link becomes a reference, the image is inserted after that paragraph's item. A line that is only an image placeholder is never joined, so a lone image keeps its own place.
+- The existing CSV, Obsidian, Joplin, Logseq and journal flows are unchanged (they most likely have the same issue; the engine option is not wired into them).
+
 ### Tests
 
 - **`npm test`** runs a Node test harness (Node 20+, no dependencies) that loads **`plugin.js`** with a stub **`AppPlugin`** and an in-memory Thymer API. Fixtures are synthetic. See **`test/README.md`**.

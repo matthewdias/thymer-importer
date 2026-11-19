@@ -68,4 +68,17 @@ test('real vault: plan counts and import into the fake', { skip: VAULT ? false :
     assert.deepEqual(p.untypedNotes, []);
     assert.deepEqual(p.skipped.map(s => s.path).sort(), ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md']);
     assert.ok(!plan.records.some(r => r.sourcePath.startsWith('.') || r.sourcePath.startsWith('attachments/')));
+
+    // soft line breaks: bodies are joined, and every link / asset placeholder is still in its body exactly once
+    assert.deepEqual(plan.options, { unwrapSoftBreaks: true });
+    const placeholders = (s) => (s.match(/⟦(?:asset|link):[A-Za-z0-9_-]+⟧/g) || []).sort();
+    let joined = 0;
+    for (const r of plan.records) {
+        const stats = {};
+        const unwrapped = plugin._planUnwrapSoftBreaks(r.body || '', stats);
+        joined += stats.joined || 0;
+        assert.deepEqual(placeholders(unwrapped), placeholders(r.body || ''), `placeholders of ${r.key} survive joining`);
+    }
+    console.log(`[tolaria real vault] body lines joined: ${joined}`);
+    assert.ok(joined > 0);
 });

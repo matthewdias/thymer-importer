@@ -7,6 +7,7 @@ const VERSION = 'v0.0.13';
  * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title renames the record via its Title property, no duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
  * v0.0.13 (review fixes, round 2) - on re-import the persisted collection is authoritative: fields are matched to existing ones by label (Tolaria / Notion field ids no longer shift when a colliding key appears later), every value is written according to the persisted field's type, many-ness and options (dates via DateTime.dateOnly / dateAndTime, links as source text in url / text fields, multi-choice tokens), a Notion page renamed in the export is matched by its page id, and existing: 'skip' also skips the link and asset passes
  * v0.0.13 (review fixes, round 3) - re-import: field labels are matched as written, then ignoring case, and ignoring space / _ / - only when that is unambiguous on both sides (Home-URL and Home_URL stay two fields); the plan keeps the source spelling of numbers, dates and choices and the persisted field converts them (000123 and 1.50 survive a column that is text in Thymer); a Notion column that is empty everywhere (and a Tolaria key that is blank in every note) clears what an earlier import stored, without creating a field; the Tolaria and Notion reports list warnings by code and the status says "Finished with warnings". Self-review: columns of zero-padded or 16+ digit numbers and impossible dates stay text, read-only / archived fields are never matched or written, look-alike Tolaria keys keep separate labels, duplicate source paths are reported
+ * v0.0.13 (soft line breaks) - Tolaria: hard-wrapped paragraphs, list items and quotes are joined into one line before insertFromMarkdown (plan.options.unwrapSoftBreaks, set by Tolaria and not by Notion, whose newlines are intentional); code, tables, html, hard breaks, nested list markers and placeholder-only lines are left as they are
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -4074,7 +4075,7 @@ class Plugin extends AppPlugin {
         const byPath = new Map(listing.files.map(f => [f.path, f]));
         const byLowerPath = new Map(listing.files.map(f => [f.path.toLowerCase(), f]));
         const byPathOrder = (a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-        const plan = this.createImportPlan('tolaria');
+        const plan = this.createImportPlan('tolaria', { unwrapSoftBreaks: true });
         const report = {
             vault: { root: listing.root, ignoredFolders: listing.ignoredFolders },
             filesRead: 0, typeDefinitions: [], unusedTypes: [], undefinedTypes: [], untypedNotes: [], skipped: [],
@@ -5647,8 +5648,14 @@ class Plugin extends AppPlugin {
     // which return the placeholder to splice into the record body.
     // =========================================================================
 
-    createImportPlan(source = '') {
-        return { version: 1, source, collections: [], records: [], links: [], assets: [], journal: [] };
+    // options (optional, only present when a source sets one):
+    //   unwrapSoftBreaks: true   join the hard-wrapped lines of a paragraph / list item / quote before insertFromMarkdown
+    //                            (see _planUnwrapSoftBreaks). Tolaria sets it; Notion does not, because Notion exports an
+    //                            intentional Shift+Enter line break as a plain newline.
+    createImportPlan(source = '', options = undefined) {
+        const plan = { version: 1, source, collections: [], records: [], links: [], assets: [], journal: [] };
+        if (options) plan.options = { ...options };
+        return plan;
     }
 
     _planTarget(target) {
@@ -6355,7 +6362,7 @@ class Plugin extends AppPlugin {
 
                 if (isUpdate) await this._planClearBody(record);
                 if (def.body) {
-                    const ok = await record.insertFromMarkdown(this._planPrepareMarkdown(def.body), null, null);
+                    const ok = await record.insertFromMarkdown(this._planPrepareMarkdown(def.body, ctx.plan.options), null, null);
                     if (!ok) throw new Error('insertFromMarkdown returned false');
                 }
                 ctx.report.counts[isUpdate ? 'recordsUpdated' : 'recordsCreated']++;
@@ -6678,8 +6685,9 @@ class Plugin extends AppPlugin {
 
     // ---- body markdown ------------------------------------------------------
 
-    /** Every body goes through this before insertFromMarkdown(). */
-    _planPrepareMarkdown(markdown) {
+    /** Every body goes through this before insertFromMarkdown(). options is plan.options. */
+    _planPrepareMarkdown(markdown, options) {
+        if (options && options.unwrapSoftBreaks) markdown = this._planUnwrapSoftBreaks(markdown);
         return this.prepareMarkdownForThymerImport(this._planRewriteStrayImages(markdown));
     }
 
@@ -6729,6 +6737,155 @@ class Plugin extends AppPlugin {
             }
             return line.includes('![') ? rewriteLine(line) : line;
         }).join('\n');
+    }
+
+    // ---- soft line breaks ---------------------------------------------------
+
+    /**
+     * Joins the hard-wrapped lines of a paragraph, list item or quote, the way CommonMark reads them: a single line
+     * break inside a paragraph is a soft break, a space. insertFromMarkdown() makes every source line its own text
+     * item instead, so a note wrapped at 80 columns imports as ragged lines (and, in a list item, as sibling text
+     * items that keep the continuation's leading spaces).
+     *
+     * A line is joined to the line before it (one space, the continuation's leading whitespace dropped) when that line is
+     * paragraph or list-item text that does not end in a hard break, and the line itself is plain text: it does not start
+     * a block (ATX heading, list marker at any indentation, quote, fence, table, thematic break, setext underline, html,
+     * a line that is only an ⟦asset:..⟧ / ⟦link:..⟧ placeholder). A line that ends in a hard break (two or more trailing
+     * spaces, or a backslash) is not joined to the next one: the marker is dropped and the next line stays its own line
+     * (Thymer has no line break inside an item). Quote lines join only to lines at the same quote depth.
+     *
+     * Left alone: fenced code (backticks and tildes, at any indentation), indented code (4+ spaces past the enclosing
+     * list item, not directly after a paragraph), tables, $$ blocks, html blocks, callout headers (> [!note]), and the
+     * nesting of lists. Placeholders are plain text to this function; they are never split or moved.
+     *
+     * Only sources that opt in use this (plan.options.unwrapSoftBreaks). stats.joined counts the joined lines.
+     */
+    _planUnwrapSoftBreaks(markdown, stats = {}) {
+        if (typeof markdown !== 'string' || !markdown.includes('\n')) return markdown;
+        const lines = markdown.split(/\r?\n/);
+        const out = [];
+        const placeholderOnly = /^\s*(?:⟦(?:asset|link):[A-Za-z0-9_-]+⟧\s*)+$/;
+        const quotePrefix = /^(?: {0,3}>[ \t]?)+/;
+        const marker = /^(\s*)([-*+]|\d{1,9}[.)])(?:(\s+)|$)/;
+        const nestedMarkers = /^(?:(?:[-*+]|\d{1,9}[.)])\s+)*(?:\[[ xX]\]\s+)?/;
+        const heading = /^#{1,6}(?:\s|$)/;
+        const thematic = /^(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/;
+        const underline = /^(?:=+|-+)\s*$/;
+        const delimiterRow = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+        const indentOf = (str) => {
+            let n = 0;
+            for (const ch of str) { if (ch === ' ') n++; else if (ch === '\t') n += 4 - (n % 4); else break; }
+            return n;
+        };
+        const unquoted = (line) => { const q = quotePrefix.exec(line); return q ? line.slice(q[0].length) : line; };
+
+        let fence = null;   // { char, length, depth } inside a fenced code block
+        let raw = null;     // regex that ends a raw html block (<pre>, <script>, <!-- -->)
+        let html = false;   // inside an html block, which ends at a blank line
+        let table = false;  // inside a table, which ends at a blank line
+        let math = false;   // inside a $$ block
+        let code = false;   // inside an indented code block
+        let stack = [];     // content indents of the open list items
+        let prev = { kind: 'blank', depth: 0 };   // kind: 'para' (text the next line may continue) | 'other' | 'blank'
+        const push = (line, kind, depth) => { out.push(line); prev = { kind, depth }; };
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const qm = quotePrefix.exec(line);
+            const prefix = qm ? qm[0] : '';
+            const depth = qm ? (prefix.match(/>/g) || []).length : 0;
+            const text = line.slice(prefix.length);
+
+            if (fence) {
+                if (depth >= fence.depth) {
+                    const close = /^\s*(`{3,}|~{3,})\s*$/.exec(text);
+                    if (close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+                    push(line, 'other', depth);
+                    continue;
+                }
+                fence = null;
+            }
+            if (depth !== prev.depth) { stack = []; table = html = code = math = false; raw = null; }
+            if (raw) { if (raw.test(text)) raw = null; push(line, 'other', depth); continue; }
+            if (math) { if (/^\s*\$\$\s*$/.test(text)) math = false; push(line, 'other', depth); continue; }
+            if (/^\s*$/.test(text)) { table = html = false; push(line, 'blank', depth); continue; }
+            if (code) { if (indentOf(text) >= 4) { push(line, 'other', depth); continue; } code = false; }
+            if (html) { push(line, 'other', depth); continue; }
+
+            const indent = indentOf(text);
+            const s = text.replace(/^\s+/, '');
+            // the content indent of the innermost open list item this line is inside of
+            let top = 0;
+            for (let k = stack.length - 1; k >= 0; k--) if (stack[k] <= indent) { top = stack[k]; break; }
+            const settle = (m) => {
+                while (stack.length && stack[stack.length - 1] > indent) stack.pop();
+                if (m) {
+                    const spaces = m[3] ? m[3].length : 0;
+                    stack.push(indent + m[2].length + (spaces === 0 || spaces > 4 ? 1 : spaces));
+                }
+            };
+            const canContinue = prev.kind === 'para' && prev.depth === depth;
+
+            // indented code cannot interrupt a paragraph; anywhere else 4+ spaces past the enclosing item is code
+            if (!canContinue && indent >= top + 4) { code = true; push(line, 'other', depth); continue; }
+
+            const fenceMatch = indent < top + 4 && /^(?:(?:[-*+]|\d{1,9}[.)])\s+)?(`{3,}|~{3,})(.*)$/.exec(s);
+            if (fenceMatch && !(fenceMatch[1][0] === '`' && fenceMatch[2].includes('`'))) {
+                settle(marker.exec(text));
+                fence = { char: fenceMatch[1][0], length: fenceMatch[1].length, depth };
+                push(line, 'other', depth);
+                continue;
+            }
+            if (/^\$\$/.test(s)) {
+                settle(null);
+                if (!/\$\$\s*$/.test(s.slice(2))) math = true;
+                push(line, 'other', depth);
+                continue;
+            }
+            if (heading.test(s) || thematic.test(s) || underline.test(s)) { settle(null); push(line, 'other', depth); continue; }
+            const next = i + 1 < lines.length ? unquoted(lines[i + 1]) : '';
+            if (s.startsWith('|') || table || (s.includes('|') && next.includes('|') && delimiterRow.test(next))) {
+                settle(null);
+                table = true;
+                push(line, 'other', depth);
+                continue;
+            }
+            if (s.startsWith('<')) {
+                settle(null);
+                const rawEnd = /^<!--/.test(s) ? { end: /-->/, from: 4 }
+                    : /^<(?:pre|script|style|textarea)(?:\s|>|$)/i.test(s) ? { end: /<\/(?:pre|script|style|textarea)>/i, from: 1 } : null;
+                if (!rawEnd) html = true;
+                else if (!rawEnd.end.test(s.slice(rawEnd.from))) raw = rawEnd.end;
+                push(line, 'other', depth);
+                continue;
+            }
+            if (s.startsWith('>')) { settle(null); push(line, 'other', depth); continue; }   // a quote the prefix did not peel (indented)
+
+            const m = marker.exec(text);
+            if (m) {
+                settle(m);
+                const inner = text.slice(m[0].length).replace(nestedMarkers, '');
+                const bare = inner.trim() === '' || placeholderOnly.test(inner) || heading.test(inner);
+                push(line, bare ? 'other' : 'para', depth);
+                continue;
+            }
+            if (placeholderOnly.test(s)) { settle(null); push(line, 'other', depth); continue; }
+            if (depth > 0 && /^\[![\w-]+\]/.test(s)) { settle(null); push(line, 'other', depth); continue; }   // > [!note] callout header
+
+            if (!canContinue) { settle(null); push(line, 'para', depth); continue; }
+
+            // a plain line that continues the paragraph or list item before it
+            const last = out[out.length - 1];
+            const backslashes = /(\\*)$/.exec(last)[1].length;
+            if (/ {2,}$/.test(last) || backslashes % 2 === 1) {
+                out[out.length - 1] = / {2,}$/.test(last) ? last.replace(/ +$/, '') : last.slice(0, -1);   // hard break: the next line stays a line
+                push(prefix + s, 'para', depth);
+            } else {
+                out[out.length - 1] = `${last.replace(/\s+$/, '')} ${s}`;
+                stats.joined = (stats.joined || 0) + 1;
+            }
+        }
+        return out.join('\n');
     }
 
     // ---- placeholders -------------------------------------------------------
@@ -7032,7 +7189,7 @@ class Plugin extends AppPlugin {
                     ctx.report.counts.journalSkipped++;
                     ctx.report.warnings.push({ code: 'journal-page-not-empty', message: `journal page ${entry.date} already has content; skipped` });
                 } else if (entry.markdown) {
-                    if (!(await page.insertFromMarkdown(this._planPrepareMarkdown(entry.markdown), null, null))) {
+                    if (!(await page.insertFromMarkdown(this._planPrepareMarkdown(entry.markdown, ctx.plan.options), null, null))) {
                         throw new Error('insertFromMarkdown returned false');
                     }
                     ctx.report.counts.journalCreated++;
