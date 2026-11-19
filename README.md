@@ -91,6 +91,7 @@ Alice,30,Active,2024-01-15
 - Keys whose values are all `[[wikilinks]]` (e.g. `related_to`, `belongs_to`) → **record references**
 - `[[note-name]]` / `[[note-name|label]]` in the text → clickable **record references**, matched by file name
 - `![](attachments/…)` → uploaded **images**
+- Hard-wrapped text (a paragraph, list item or quote broken at about 80 columns) is joined into one line, as Markdown reads it; code, tables, html, hard breaks and list nesting are left as they are
 - Skipped: `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` at the vault root, dot-folders (`.git`, `.claude`, …) and Tolaria UI state (`_organized`, `_favorite`, `_icon`, `visible`, `color`, …)
 - Links to notes that don't exist stay as `[[text]]`
 
